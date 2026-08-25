@@ -6,9 +6,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 
-# =========================
+
+# =========================================================
 # НАСТРОЙКИ
-# =========================
+# =========================================================
 
 EXCHANGE_NAMES = [
     "kraken",
@@ -24,25 +25,28 @@ SYMBOLS = [
     "XRP/USDT",
 ]
 
-# Обновление каждые 15 секунд
+# Как часто запускать новый скан
 SCAN_INTERVAL = 15
 
-# Таймаут одного запроса к бирже
-REQUEST_TIMEOUT = 5000
+# Таймаут запросов к биржам
+REQUEST_TIMEOUT = 8000
 
-# Комиссия покупки 0.1%
+# Комиссия на покупку
 BUY_FEE = 0.001
 
-# Комиссия продажи 0.1%
+# Комиссия на продажу
 SELL_FEE = 0.001
 
-# Минимальная чистая прибыль после комиссий
+# Минимальная ЧИСТАЯ прибыль после комиссий
 MIN_NET_PROFIT = 0.07
 
+# Максимальное количество потоков
+MAX_WORKERS = 4
 
-# =========================
+
+# =========================================================
 # ОБЩЕЕ СОСТОЯНИЕ СКАНЕРА
-# =========================
+# =========================================================
 
 scanner_state = {
     "status": "starting",
@@ -52,15 +56,16 @@ scanner_state = {
     "prices_received": 0,
     "last_scan": None,
     "error": None,
+    "diagnostics": {},
 }
 
 state_lock = threading.Lock()
 scan_lock = threading.Lock()
 
 
-# =========================
+# =========================================================
 # СОЗДАНИЕ БИРЖИ
-# =========================
+# =========================================================
 
 def get_exchange(name):
     exchange_class = getattr(ccxt, name)
@@ -71,39 +76,39 @@ def get_exchange(name):
     })
 
 
-# =========================
+# =========================================================
 # СКАНИРОВАНИЕ ОДНОЙ БИРЖИ
-# =========================
+# =========================================================
 
 def scan_exchange(exchange_name):
+
     results = []
-    errors = []
+    diagnostic = {
+        "status": "starting",
+        "prices_received": 0,
+        "errors": [],
+    }
+
+    exchange = None
 
     try:
         exchange = get_exchange(exchange_name)
 
-        print(f"[{exchange_name}] Загружаю рынки...")
+        diagnostic["status"] = "loading_markets"
 
-        exchange.load_markets()
+        markets = exchange.load_markets()
 
-        print(
-            f"[{exchange_name}] Рынки загружены. "
-            f"Проверяю {len(SYMBOLS)} пары."
-        )
+        diagnostic["status"] = "scanning"
 
         for symbol in SYMBOLS:
 
             try:
+
                 # Проверяем, существует ли такая пара
-                if symbol not in exchange.markets:
-                    error_message = (
-                        f"{exchange_name}: "
-                        f"пара {symbol} недоступна"
+                if symbol not in markets:
+                    diagnostic["errors"].append(
+                        f"{symbol}: пара недоступна"
                     )
-
-                    errors.append(error_message)
-                    print(error_message)
-
                     continue
 
                 ticker = exchange.fetch_ticker(symbol)
@@ -111,73 +116,74 @@ def scan_exchange(exchange_name):
                 bid = ticker.get("bid")
                 ask = ticker.get("ask")
 
-                if (
-                    bid is not None
-                    and ask is not None
-                    and bid > 0
-                    and ask > 0
-                ):
-
-                    results.append({
-                        "exchange": exchange_name,
-                        "symbol": symbol,
-                        "bid": float(bid),
-                        "ask": float(ask),
-                    })
-
-                    print(
-                        f"[{exchange_name}] "
-                        f"{symbol} OK | "
-                        f"bid={bid} ask={ask}"
+                if bid is None or ask is None:
+                    diagnostic["errors"].append(
+                        f"{symbol}: нет bid/ask"
                     )
+                    continue
 
-                else:
-                    error_message = (
-                        f"{exchange_name} {symbol}: "
-                        f"нет корректных bid/ask. "
-                        f"bid={bid}, ask={ask}"
+                bid = float(bid)
+                ask = float(ask)
+
+                if bid <= 0 or ask <= 0:
+                    diagnostic["errors"].append(
+                        f"{symbol}: некорректная цена"
                     )
+                    continue
 
-                    errors.append(error_message)
-                    print(error_message)
+                results.append({
+                    "exchange": exchange_name,
+                    "symbol": symbol,
+                    "bid": bid,
+                    "ask": ask,
+                })
 
             except Exception as error:
 
-                error_message = (
-                    f"{exchange_name} {symbol}: "
-                    f"{type(error).__name__}: {str(error)}"
+                diagnostic["errors"].append(
+                    f"{symbol}: {str(error)[:120]}"
                 )
 
-                errors.append(error_message)
-                print(error_message)
+                continue
+
+        diagnostic["prices_received"] = len(results)
+
+        if len(results) > 0:
+            diagnostic["status"] = "success"
+        else:
+            diagnostic["status"] = "no_prices"
 
     except Exception as error:
 
-        error_message = (
-            f"{exchange_name}: "
-            f"ошибка подключения: "
-            f"{type(error).__name__}: {str(error)}"
+        diagnostic["status"] = "exchange_error"
+
+        diagnostic["errors"].append(
+            str(error)[:200]
         )
 
-        errors.append(error_message)
-        print(error_message)
+    finally:
 
-    return results, errors
+        try:
+            if exchange is not None:
+                exchange.close()
+        except Exception:
+            pass
+
+    return results, diagnostic
 
 
-# =========================
-# ОДИН ПОЛНЫЙ СКАН
-# =========================
+# =========================================================
+# ПОЛНЫЙ СКАН ВСЕХ БИРЖ
+# =========================================================
 
 def get_opportunities():
 
     all_prices = []
-    all_errors = []
+    diagnostics = {}
 
-    print("\n========== НАЧАЛО СКАНИРОВАНИЯ ==========")
-
-    # Сканируем биржи одновременно
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
 
         futures = {
             executor.submit(
@@ -185,7 +191,8 @@ def get_opportunities():
                 exchange_name
             ): exchange_name
 
-            for exchange_name in EXCHANGE_NAMES
+            for exchange_name
+            in EXCHANGE_NAMES
         }
 
         for future in as_completed(futures):
@@ -193,74 +200,48 @@ def get_opportunities():
             exchange_name = futures[future]
 
             try:
-                prices, errors = future.result()
+
+                prices, diagnostic = future.result()
 
                 all_prices.extend(prices)
-                all_errors.extend(errors)
+
+                diagnostics[exchange_name] = diagnostic
 
             except Exception as error:
 
-                error_message = (
-                    f"{exchange_name}: "
-                    f"критическая ошибка: "
-                    f"{type(error).__name__}: {str(error)}"
-                )
-
-                all_errors.append(error_message)
-                print(error_message)
-
-    print(
-        f"ВСЕГО ЦЕН ПОЛУЧЕНО: "
-        f"{len(all_prices)}"
-    )
-
-    print(
-        f"ВСЕГО ОШИБОК: "
-        f"{len(all_errors)}"
-    )
-
-    if all_errors:
-
-        print("\n========== СПИСОК ОШИБОК ==========")
-
-        for error in all_errors:
-            print(error)
-
-        print("===================================")
+                diagnostics[exchange_name] = {
+                    "status": "future_error",
+                    "prices_received": 0,
+                    "errors": [
+                        str(error)[:200]
+                    ],
+                }
 
     opportunities = []
 
-    # =========================
-    # ИЩЕМ АРБИТРАЖ
-    # =========================
+    # =====================================================
+    # ИЩЕМ ЛУЧШУЮ ПОКУПКУ И ЛУЧШУЮ ПРОДАЖУ
+    # =====================================================
 
     for symbol in SYMBOLS:
 
-        prices = [
+        symbol_prices = [
             item
             for item in all_prices
             if item["symbol"] == symbol
         ]
 
-        if len(prices) < 2:
-
-            print(
-                f"{symbol}: "
-                f"недостаточно цен для сравнения "
-                f"({len(prices)})"
-            )
-
+        # Нужно минимум две биржи
+        if len(symbol_prices) < 2:
             continue
 
-        # Лучшая цена покупки
         buy_exchange = min(
-            prices,
+            symbol_prices,
             key=lambda x: x["ask"]
         )
 
-        # Лучшая цена продажи
         sell_exchange = max(
-            prices,
+            symbol_prices,
             key=lambda x: x["bid"]
         )
 
@@ -269,33 +250,27 @@ def get_opportunities():
             buy_exchange["exchange"]
             == sell_exchange["exchange"]
         ):
-
-            print(
-                f"{symbol}: "
-                f"лучшая покупка и продажа "
-                f"на одной бирже "
-                f"({buy_exchange['exchange']})"
-            )
-
             continue
 
         buy_price = buy_exchange["ask"]
         sell_price = sell_exchange["bid"]
 
-        # Валовой спред
+        # Валовый спред
         gross_spread = (
             (sell_price - buy_price)
             / buy_price
         ) * 100
 
         # Цена покупки с комиссией
-        buy_cost = buy_price * (
-            1 + BUY_FEE
+        buy_cost = (
+            buy_price
+            * (1 + BUY_FEE)
         )
 
-        # Выручка от продажи с комиссией
-        sell_revenue = sell_price * (
-            1 - SELL_FEE
+        # Доход после продажи с комиссией
+        sell_revenue = (
+            sell_price
+            * (1 - SELL_FEE)
         )
 
         # Чистая прибыль
@@ -304,92 +279,72 @@ def get_opportunities():
             / buy_cost
         ) * 100
 
-        print(
-            f"{symbol}: "
-            f"купить {buy_exchange['exchange']} "
-            f"${buy_price} | "
-            f"продать {sell_exchange['exchange']} "
-            f"${sell_price} | "
-            f"валовая {gross_spread:.3f}% | "
-            f"чистая {net_profit_percent:.3f}%"
-        )
-
-        # Добавляем только выгодные варианты
+        # Фильтр по минимальной прибыли
         if net_profit_percent >= MIN_NET_PROFIT:
 
             opportunities.append({
-
                 "symbol": symbol,
 
                 "buy_exchange":
                     buy_exchange["exchange"].upper(),
 
                 "buy_price":
-                    round(buy_price, 4),
+                    round(buy_price, 6),
 
                 "sell_exchange":
                     sell_exchange["exchange"].upper(),
 
                 "sell_price":
-                    round(sell_price, 4),
+                    round(sell_price, 6),
 
                 "gross_spread_percent":
-                    round(gross_spread, 3),
+                    round(gross_spread, 4),
 
                 "net_profit_percent":
-                    round(net_profit_percent, 3),
+                    round(net_profit_percent, 4),
             })
 
     opportunities.sort(
-        key=lambda x: x["net_profit_percent"],
+        key=lambda x:
+            x["net_profit_percent"],
         reverse=True
     )
 
-    print(
-        f"ВОЗМОЖНОСТЕЙ НАЙДЕНО: "
-        f"{len(opportunities)}"
+    return (
+        opportunities,
+        all_prices,
+        diagnostics
     )
 
-    print(
-        "========== КОНЕЦ СКАНИРОВАНИЯ ==========\n"
-    )
 
-    return opportunities, all_prices, all_errors
-
-
-# =========================
-# ЗАПУСК ОДНОГО СКАНА
-# =========================
+# =========================================================
+# ОДИН ФОНОВЫЙ СКАН
+# =========================================================
 
 def run_scan():
 
-    # Не запускаем два скана одновременно
-    if not scan_lock.acquire(blocking=False):
-
-        print(
-            "Предыдущий скан ещё работает. "
-            "Новый скан пропущен."
-        )
-
+    # Не даём двум сканам идти одновременно
+    if not scan_lock.acquire(
+        blocking=False
+    ):
         return
 
     try:
 
         with state_lock:
+
             scanner_state["status"] = "scanning"
             scanner_state["error"] = None
 
-        print("Запускаю новый фоновый скан...")
-
-        (
-            opportunities,
-            prices,
-            errors
-        ) = get_opportunities()
+        opportunities, prices, diagnostics = (
+            get_opportunities()
+        )
 
         with state_lock:
 
-            scanner_state["opportunities"] = opportunities
+            scanner_state["opportunities"] = (
+                opportunities
+            )
 
             scanner_state["prices"] = prices
 
@@ -402,44 +357,27 @@ def run_scan():
             ] = len(prices)
 
             scanner_state[
-                "last_scan"
-            ] = time.strftime(
-                "%d.%m.%Y %H:%M:%S"
+                "diagnostics"
+            ] = diagnostics
+
+            scanner_state["last_scan"] = (
+                time.strftime(
+                    "%d.%m.%Y %H:%M:%S"
+                )
             )
 
-            # Сохраняем ошибки для API
-            if errors:
-                scanner_state["error"] = "\n".join(
-                    errors
-                )
-            else:
-                scanner_state["error"] = None
+            scanner_state["status"] = "active"
 
-            # Если хотя бы часть цен получена —
-            # сканер считаем рабочим
-            if len(prices) > 0:
-                scanner_state["status"] = "active"
-            else:
-                scanner_state["status"] = "error"
+            scanner_state["error"] = None
 
     except Exception as error:
-
-        error_message = (
-            f"{type(error).__name__}: "
-            f"{str(error)}"
-        )
-
-        print(
-            "КРИТИЧЕСКАЯ ОШИБКА СКАНЕРА: "
-            + error_message
-        )
 
         with state_lock:
 
             scanner_state["status"] = "error"
 
-            scanner_state["error"] = (
-                error_message
+            scanner_state["error"] = str(
+                error
             )
 
     finally:
@@ -447,31 +385,25 @@ def run_scan():
         scan_lock.release()
 
 
-# =========================
+# =========================================================
 # ПОСТОЯННЫЙ ФОНОВЫЙ СКАНЕР
-# =========================
+# =========================================================
 
 def scanner_loop():
-
-    print(
-        "Фоновый сканер запущен."
-    )
 
     # Первый скан сразу после запуска
     run_scan()
 
     while True:
 
-        time.sleep(
-            SCAN_INTERVAL
-        )
+        time.sleep(SCAN_INTERVAL)
 
         run_scan()
 
 
-# =========================
+# =========================================================
 # ЗАПУСК ФОНОВОГО ПОТОКА
-# =========================
+# =========================================================
 
 scanner_thread = threading.Thread(
     target=scanner_loop,
@@ -481,9 +413,9 @@ scanner_thread = threading.Thread(
 scanner_thread.start()
 
 
-# =========================
+# =========================================================
 # ГЛАВНАЯ СТРАНИЦА
-# =========================
+# =========================================================
 
 @app.route("/")
 def home():
@@ -496,7 +428,9 @@ def home():
 
             "opportunities":
                 list(
-                    scanner_state["opportunities"]
+                    scanner_state[
+                        "opportunities"
+                    ]
                 ),
 
             "opportunities_found":
@@ -518,9 +452,22 @@ def home():
                 scanner_state[
                     "error"
                 ],
+
+            "diagnostics":
+                dict(
+                    scanner_state[
+                        "diagnostics"
+                    ]
+                ),
+
+            # ВАЖНО:
+            # Берём цифру прямо из настройки
+            "min_net_profit":
+                MIN_NET_PROFIT,
         }
 
-    return render_template_string("""
+    return render_template_string(
+        """
 <!DOCTYPE html>
 <html lang="ru">
 
@@ -571,9 +518,13 @@ h1 {
 
 .status {
     display: inline-block;
+
     padding: 12px 20px;
+
     border-radius: 30px;
+
     font-size: 18px;
+
     margin-bottom: 25px;
 }
 
@@ -595,81 +546,116 @@ h1 {
 
 .info-box {
     background: #151e2e;
+
     border: 1px solid #26364f;
+
     border-radius: 20px;
+
     padding: 22px;
+
     margin-bottom: 25px;
+
     color: #aeb8c8;
+
     font-size: 18px;
+
     line-height: 1.8;
 }
 
 .stats {
     display: flex;
+
     gap: 20px;
+
     margin-bottom: 25px;
 }
 
 .stat {
     flex: 1;
+
     background: #151e2e;
+
     border: 1px solid #26364f;
+
     border-radius: 20px;
+
     padding: 25px;
 }
 
 .stat-value {
     font-size: 44px;
+
     font-weight: bold;
+
     color: #60a5fa;
 }
 
 .stat-label {
     color: #aeb8c8;
+
     font-size: 18px;
+
     margin-top: 10px;
 }
 
 .card {
     background: #151e2e;
+
     border: 1px solid #26364f;
+
     border-radius: 20px;
+
     padding: 25px;
+
     margin-bottom: 20px;
 }
 
 .card-header {
     display: flex;
+
     justify-content: space-between;
+
     align-items: center;
+
     gap: 15px;
+
     margin-bottom: 20px;
 }
 
 .symbol {
     font-size: 30px;
+
     font-weight: bold;
 }
 
 .spread {
     background: #065f46;
+
     color: #6ee7b7;
+
     padding: 10px 18px;
+
     border-radius: 30px;
+
     font-size: 20px;
+
     font-weight: bold;
+
     white-space: nowrap;
 }
 
 .trade-row {
     display: grid;
+
     grid-template-columns: 1fr 1fr;
+
     gap: 18px;
 }
 
 .buy,
 .sell {
     padding: 20px;
+
     border-radius: 16px;
 }
 
@@ -683,46 +669,102 @@ h1 {
 
 .label {
     color: #b7c0d0;
+
     font-size: 16px;
+
     margin-bottom: 10px;
 }
 
 .exchange {
     font-size: 25px;
+
     font-weight: bold;
 }
 
 .price {
     font-size: 22px;
+
     margin-top: 10px;
 }
 
 .empty {
     text-align: center;
+
     background: #151e2e;
+
     border: 1px solid #26364f;
+
     padding: 45px 25px;
+
     border-radius: 20px;
+
     color: #aeb8c8;
+
     font-size: 20px;
+
     line-height: 1.6;
 }
 
-.error-box {
-    background: #3b1620;
-    border: 1px solid #7f1d1d;
+.diagnostics {
+    margin-top: 25px;
+
+    background: #151e2e;
+
+    border: 1px solid #26364f;
+
+    border-radius: 20px;
+
     padding: 20px;
-    border-radius: 16px;
+}
+
+.diagnostics h2 {
+    margin-top: 0;
+    font-size: 22px;
+}
+
+.diagnostic-item {
+    padding: 15px;
+
+    border-top:
+        1px solid #26364f;
+}
+
+.diagnostic-item:first-of-type {
+    border-top: none;
+}
+
+.diag-name {
+    font-size: 18px;
+    font-weight: bold;
+}
+
+.diag-status {
+    color: #60a5fa;
+    margin-top: 5px;
+}
+
+.diag-prices {
+    color: #6ee7b7;
+    margin-top: 5px;
+}
+
+.diag-errors {
     color: #fca5a5;
-    margin-bottom: 25px;
-    white-space: pre-wrap;
-    overflow-wrap: anywhere;
+
+    margin-top: 8px;
+
+    font-size: 14px;
+
+    word-break: break-word;
 }
 
 .footer {
     text-align: center;
+
     color: #6b7280;
+
     margin-top: 30px;
+
     font-size: 14px;
 }
 
@@ -790,7 +832,7 @@ h1 {
 {% else %}
 
 <div class="status error">
-● Ошибка получения цен
+● Ошибка сканирования
 </div>
 
 {% endif %}
@@ -798,7 +840,8 @@ h1 {
 
 <div class="info-box">
 
-🎯 Минимальная чистая прибыль: 0.1%
+🎯 Минимальная чистая прибыль:
+{{ min_net_profit }}%
 
 <br>
 
@@ -806,11 +849,13 @@ h1 {
 
 <br>
 
-🔄 Фоновое обновление каждые 15 секунд
+🔄 Фоновое обновление каждые
+{{ 15 }} секунд
 
 <br>
 
-💵 Расчёт сделки: $1000
+💵 Расчёт сделки:
+$1000
 
 {% if last_scan %}
 
@@ -822,21 +867,6 @@ h1 {
 {% endif %}
 
 </div>
-
-
-{% if error %}
-
-<div class="error-box">
-
-⚠️ Диагностика сканера:
-
-<br><br>
-
-{{ error }}
-
-</div>
-
-{% endif %}
 
 
 <div class="stats">
@@ -935,7 +965,8 @@ ${{ item.sell_price }}
 <div class="empty">
 
 🔍 Сейчас нет возможностей
-с чистой прибылью от 0.1%.
+с чистой прибылью от
+{{ min_net_profit }}%.
 
 <br><br>
 
@@ -946,10 +977,67 @@ ${{ item.sell_price }}
 {% endif %}
 
 
+<div class="diagnostics">
+
+<h2>🔧 Диагностика бирж</h2>
+
+{% for name, diag in diagnostics.items() %}
+
+<div class="diagnostic-item">
+
+<div class="diag-name">
+{{ name.upper() }}
+</div>
+
+<div class="diag-status">
+Статус: {{ diag.status }}
+</div>
+
+<div class="diag-prices">
+Цен получено:
+{{ diag.prices_received }}
+</div>
+
+{% if diag.errors %}
+
+<div class="diag-errors">
+
+{% for error in diag.errors[:3] %}
+
+• {{ error }}<br>
+
+{% endfor %}
+
+</div>
+
+{% endif %}
+
+</div>
+
+{% endfor %}
+
+</div>
+
+
+{% if error %}
+
+<div class="diagnostics">
+
+<h2>❌ Общая ошибка</h2>
+
+<div class="diag-errors">
+{{ error }}
+</div>
+
+</div>
+
+{% endif %}
+
+
 <div class="footer">
 
-Страница обновляется автоматически •
-Следующее сканирование через 15 секунд
+Автоматическое обновление страницы каждые
+{{ 15 }} секунд
 
 </div>
 
@@ -958,20 +1046,25 @@ ${{ item.sell_price }}
 
 <script>
 
-setTimeout(function () {
-    window.location.reload();
-}, 15000);
+setTimeout(
+    function () {
+        window.location.reload();
+    },
+    15000
+);
 
 </script>
 
 </body>
 </html>
-    """, **data)
+        """,
+        **data
+    )
 
 
-# =========================
+# =========================================================
 # JSON API
-# =========================
+# =========================================================
 
 @app.route("/scan")
 def scan():
@@ -982,6 +1075,9 @@ def scan():
 
             "status":
                 scanner_state["status"],
+
+            "min_net_profit":
+                MIN_NET_PROFIT,
 
             "opportunities_found":
                 scanner_state[
@@ -1008,6 +1104,11 @@ def scan():
                     "last_scan"
                 ],
 
+            "diagnostics":
+                scanner_state[
+                    "diagnostics"
+                ],
+
             "error":
                 scanner_state[
                     "error"
@@ -1015,9 +1116,9 @@ def scan():
         })
 
 
-# =========================
-# ЗАПУСК СЕРВЕРА
-# =========================
+# =========================================================
+# ЗАПУСК FLASK
+# =========================================================
 
 if __name__ == "__main__":
 
