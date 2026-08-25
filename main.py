@@ -13,21 +13,32 @@ from flask import Flask, jsonify, render_template_string
 # НАСТРОЙКИ
 # ============================================================
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = str(os.getenv("TELEGRAM_CHAT_ID", "")).strip()
+TELEGRAM_BOT_TOKEN = os.getenv(
+    "TELEGRAM_BOT_TOKEN",
+    ""
+).strip()
 
+TELEGRAM_CHAT_ID = str(
+    os.getenv(
+        "TELEGRAM_CHAT_ID",
+        ""
+    )
+).strip()
+
+
+# Размер одной сделки
 TRADE_AMOUNT_USD = 1000
 
 # Минимальная чистая прибыль
 MIN_NET_PROFIT_PERCENT = 0.01
 
-# Интервал сканирования
+# Интервал полного сканирования
 SCAN_INTERVAL = 15
 
-# Интервал проверки Telegram
+# Интервал повторной проверки Telegram
 TELEGRAM_POLL_INTERVAL = 2
 
-# Не отправлять одну и ту же связку слишком часто
+# Не отправлять одинаковую связку слишком часто
 NOTIFICATION_COOLDOWN = 300
 
 # Сколько возможностей максимум отправлять за один скан
@@ -52,6 +63,11 @@ EXCHANGE_NAMES = {
     "bybit": "BYBIT",
 }
 
+
+# ============================================================
+# МОНЕТЫ
+# ============================================================
+
 SYMBOLS = [
     "BTC/USDT",
     "ETH/USDT",
@@ -62,6 +78,11 @@ SYMBOLS = [
     "AVAX/USDT",
     "LINK/USDT",
 ]
+
+
+# ============================================================
+# ПОДКЛЮЧАЕМЫЕ БИРЖИ
+# ============================================================
 
 EXCHANGE_CLASSES = {
     "kraken": ccxt.kraken,
@@ -91,16 +112,19 @@ for exchange_id, exchange_class in EXCHANGE_CLASSES.items():
             "timeout": 10000,
         })
 
-        print(f"✅ Подключена биржа: {exchange_id}")
+        print(
+            f"✅ Подключена биржа: {exchange_id}"
+        )
 
     except Exception as e:
         print(
-            f"❌ Ошибка подключения {exchange_id}: {e}"
+            f"❌ Ошибка подключения "
+            f"{exchange_id}: {e}"
         )
 
 
 # ============================================================
-# СОСТОЯНИЕ
+# СОСТОЯНИЕ СИСТЕМЫ
 # ============================================================
 
 last_opportunities = []
@@ -111,6 +135,15 @@ pending_opportunities = {}
 
 scanner_started = False
 telegram_started = False
+services_started = False
+
+# Текущая информация о сканировании
+current_symbol = None
+current_symbol_index = 0
+current_scan_total = len(SYMBOLS)
+
+total_scans = 0
+total_opportunities_found = 0
 
 lock = threading.Lock()
 startup_lock = threading.Lock()
@@ -120,13 +153,19 @@ startup_lock = threading.Lock()
 # TELEGRAM API
 # ============================================================
 
-def telegram_api(method, data=None, request_method="POST"):
+def telegram_api(
+    method,
+    data=None,
+    request_method="POST"
+):
     """
     Запрос к Telegram Bot API.
     """
 
     if not TELEGRAM_BOT_TOKEN:
-        print("❌ TELEGRAM_BOT_TOKEN отсутствует")
+        print(
+            "❌ TELEGRAM_BOT_TOKEN отсутствует"
+        )
         return None
 
     url = (
@@ -135,13 +174,17 @@ def telegram_api(method, data=None, request_method="POST"):
     )
 
     try:
+
         if request_method == "GET":
+
             response = requests.get(
                 url,
                 params=data or {},
                 timeout=30,
             )
+
         else:
+
             response = requests.post(
                 url,
                 json=data or {},
@@ -151,6 +194,7 @@ def telegram_api(method, data=None, request_method="POST"):
         result = response.json()
 
         if not result.get("ok"):
+
             print(
                 f"❌ Telegram API {method}: "
                 f"{result}"
@@ -159,6 +203,7 @@ def telegram_api(method, data=None, request_method="POST"):
         return result
 
     except Exception as e:
+
         print(
             f"❌ Telegram API ошибка "
             f"({method}): {e}"
@@ -168,142 +213,33 @@ def telegram_api(method, data=None, request_method="POST"):
 
 
 # ============================================================
-# ПРОВЕРКА TELEGRAM ПРИ ЗАПУСКЕ
-# ============================================================
-
-def check_telegram_connection():
-    """
-    Проверяет токен и отправляет стартовое сообщение.
-    """
-
-    print("")
-    print("==========================================")
-    print("🤖 ПРОВЕРКА TELEGRAM")
-    print("==========================================")
-
-    if not TELEGRAM_BOT_TOKEN:
-        print(
-            "❌ TELEGRAM_BOT_TOKEN не найден "
-            "в Variables Railway"
-        )
-        return False
-
-    if not TELEGRAM_CHAT_ID:
-        print(
-            "❌ TELEGRAM_CHAT_ID не найден "
-            "в Variables Railway"
-        )
-        return False
-
-    print("🔑 Проверяю Telegram токен...")
-
-    result = telegram_api(
-        "getMe",
-        request_method="GET"
-    )
-
-    if not result or not result.get("ok"):
-        print("")
-        print("❌ TELEGRAM ТОКЕН НЕ РАБОТАЕТ")
-        print(
-            "Проверь новый TELEGRAM_BOT_TOKEN "
-            "в Railway."
-        )
-        print("")
-
-        return False
-
-    bot = result.get("result", {})
-    bot_name = bot.get("username", "неизвестно")
-
-    print(
-        f"✅ Telegram токен работает"
-    )
-
-    print(
-        f"🤖 Бот: @{bot_name}"
-    )
-
-    print(
-        f"💬 Chat ID: {TELEGRAM_CHAT_ID}"
-    )
-
-    startup_text = f"""
-🟢 <b>АРБИТРАЖНЫЙ БОТ ЗАПУЩЕН</b>
-
-🤖 Бот: <b>@{bot_name}</b>
-
-💰 Размер сделки:
-<b>${TRADE_AMOUNT_USD}</b>
-
-📈 Минимальная чистая прибыль:
-<b>{MIN_NET_PROFIT_PERCENT}%</b>
-
-🔄 Сканирование каждые:
-<b>{SCAN_INTERVAL} секунд</b>
-
-🪙 Монет отслеживается:
-<b>{len(SYMBOLS)}</b>
-
-📊 Бирж подключено:
-<b>{len(exchanges)}</b>
-
-🚀 Система готова к поиску возможностей.
-"""
-
-    send_result = send_telegram_message(
-        startup_text
-    )
-
-    if send_result and send_result.get("ok"):
-        print(
-            "✅ Стартовое сообщение "
-            "успешно отправлено в Telegram"
-        )
-    else:
-        print("")
-        print(
-            "❌ ТОКЕН РАБОТАЕТ, НО СООБЩЕНИЕ "
-            "НЕ ОТПРАВЛЕНО"
-        )
-        print(
-            "👉 Открой Telegram, зайди в своего "
-            "бота и нажми START."
-        )
-        print(
-            "👉 Также проверь TELEGRAM_CHAT_ID."
-        )
-        print("")
-
-        return False
-
-    print("==========================================")
-    print("")
-
-    return True
-
-
-# ============================================================
 # ОТПРАВКА TELEGRAM СООБЩЕНИЯ
 # ============================================================
 
-def send_telegram_message(text, reply_markup=None):
+def send_telegram_message(
+    text,
+    reply_markup=None
+):
     """
     Отправляет сообщение пользователю.
     """
 
     if not TELEGRAM_BOT_TOKEN:
+
         print(
             "❌ Невозможно отправить Telegram: "
             "нет TOKEN"
         )
+
         return None
 
     if not TELEGRAM_CHAT_ID:
+
         print(
             "❌ Невозможно отправить Telegram: "
             "нет CHAT_ID"
         )
+
         return None
 
     data = {
@@ -333,25 +269,168 @@ def answer_callback_query(
     return telegram_api(
         "answerCallbackQuery",
         {
-            "callback_query_id": callback_query_id,
-            "text": text,
+            "callback_query_id":
+                callback_query_id,
+
+            "text":
+                text,
         },
     )
+
+
+# ============================================================
+# ПРОВЕРКА TELEGRAM
+# ============================================================
+
+def check_telegram_connection():
+
+    print("")
+    print(
+        "=========================================="
+    )
+    print(
+        "🤖 ПРОВЕРКА TELEGRAM"
+    )
+    print(
+        "=========================================="
+    )
+
+    if not TELEGRAM_BOT_TOKEN:
+
+        print(
+            "❌ TELEGRAM_BOT_TOKEN не найден "
+            "в Variables Railway"
+        )
+
+        return False
+
+    if not TELEGRAM_CHAT_ID:
+
+        print(
+            "❌ TELEGRAM_CHAT_ID не найден "
+            "в Variables Railway"
+        )
+
+        return False
+
+    print(
+        "🔑 Проверяю Telegram токен..."
+    )
+
+    result = telegram_api(
+        "getMe",
+        request_method="GET"
+    )
+
+    if not result or not result.get("ok"):
+
+        print(
+            "❌ TELEGRAM ТОКЕН НЕ РАБОТАЕТ"
+        )
+
+        return False
+
+    bot = result.get(
+        "result",
+        {}
+    )
+
+    bot_name = bot.get(
+        "username",
+        "неизвестно"
+    )
+
+    print(
+        "✅ Telegram токен работает"
+    )
+
+    print(
+        f"🤖 Бот: @{bot_name}"
+    )
+
+    print(
+        f"💬 Chat ID: {TELEGRAM_CHAT_ID}"
+    )
+
+    startup_text = f"""
+🟢 <b>АРБИТРАЖНЫЙ БОТ ЗАПУЩЕН</b>
+
+🤖 Бот:
+<b>@{bot_name}</b>
+
+💰 Размер сделки:
+<b>${TRADE_AMOUNT_USD}</b>
+
+📈 Минимальная чистая прибыль:
+<b>{MIN_NET_PROFIT_PERCENT}%</b>
+
+🔄 Интервал сканирования:
+<b>{SCAN_INTERVAL} секунд</b>
+
+🪙 Всего монет:
+<b>{len(SYMBOLS)}</b>
+
+🏦 Бирж подключено:
+<b>{len(exchanges)}</b>
+
+🔍 Каждая монета сравнивается
+между всеми доступными биржами.
+
+🚀 Система готова к поиску
+арбитражных возможностей.
+"""
+
+    send_result = send_telegram_message(
+        startup_text
+    )
+
+    if (
+        send_result
+        and send_result.get("ok")
+    ):
+
+        print(
+            "✅ Стартовое сообщение "
+            "отправлено в Telegram"
+        )
+
+    else:
+
+        print(
+            "❌ Telegram токен работает, "
+            "но сообщение не отправлено"
+        )
+
+        return False
+
+    print(
+        "=========================================="
+    )
+
+    return True
 
 
 # ============================================================
 # ПОЛУЧЕНИЕ ЦЕНЫ
 # ============================================================
 
-def get_price(exchange_id, symbol):
+def get_price(
+    exchange_id,
+    symbol
+):
 
-    exchange = exchanges.get(exchange_id)
+    exchange = exchanges.get(
+        exchange_id
+    )
 
     if not exchange:
         return None
 
     try:
-        ticker = exchange.fetch_ticker(symbol)
+
+        ticker = exchange.fetch_ticker(
+            symbol
+        )
 
         ask = ticker.get("ask")
         bid = ticker.get("bid")
@@ -371,9 +450,11 @@ def get_price(exchange_id, symbol):
         }
 
     except Exception as e:
+
         print(
             f"⚠️ Ошибка цены "
-            f"{exchange_id} {symbol}: {e}"
+            f"{exchange_id} "
+            f"{symbol}: {e}"
         )
 
         return None
@@ -401,27 +482,38 @@ def calculate_opportunity(
         0.10
     )
 
-    # Реальная стоимость покупки
-    buy_cost = TRADE_AMOUNT_USD * (
-        1 + buy_fee_percent / 100
+    # Стоимость покупки с комиссией
+    buy_cost = (
+        TRADE_AMOUNT_USD
+        * (
+            1 + buy_fee_percent / 100
+        )
     )
 
-    # Количество монет, которое покупаем
+    # Количество покупаемой монеты
     quantity = (
-        TRADE_AMOUNT_USD / buy_price
+        TRADE_AMOUNT_USD
+        / buy_price
     )
 
-    # Выручка от продажи
-    gross_revenue = quantity * sell_price
+    # Валовая выручка
+    gross_revenue = (
+        quantity
+        * sell_price
+    )
 
-    # После комиссии продажи
-    sell_revenue = gross_revenue * (
-        1 - sell_fee_percent / 100
+    # Выручка после комиссии продажи
+    sell_revenue = (
+        gross_revenue
+        * (
+            1 - sell_fee_percent / 100
+        )
     )
 
     # Чистая прибыль
     net_profit_usd = (
-        sell_revenue - buy_cost
+        sell_revenue
+        - buy_cost
     )
 
     net_profit_percent = (
@@ -430,14 +522,20 @@ def calculate_opportunity(
     ) * 100
 
     gross_spread_percent = (
-        (sell_price - buy_price)
+        (
+            sell_price
+            - buy_price
+        )
         / buy_price
     ) * 100
 
     return {
-        "symbol": symbol,
 
-        "buy_exchange": buy_exchange,
+        "symbol":
+            symbol,
+
+        "buy_exchange":
+            buy_exchange,
 
         "buy_exchange_name":
             EXCHANGE_NAMES.get(
@@ -445,12 +543,14 @@ def calculate_opportunity(
                 buy_exchange.upper()
             ),
 
-        "buy_price": round(
-            buy_price,
-            8
-        ),
+        "buy_price":
+            round(
+                buy_price,
+                8
+            ),
 
-        "sell_exchange": sell_exchange,
+        "sell_exchange":
+            sell_exchange,
 
         "sell_exchange_name":
             EXCHANGE_NAMES.get(
@@ -458,25 +558,29 @@ def calculate_opportunity(
                 sell_exchange.upper()
             ),
 
-        "sell_price": round(
-            sell_price,
-            8
-        ),
+        "sell_price":
+            round(
+                sell_price,
+                8
+            ),
 
-        "gross_spread_percent": round(
-            gross_spread_percent,
-            4
-        ),
+        "gross_spread_percent":
+            round(
+                gross_spread_percent,
+                4
+            ),
 
-        "net_profit_percent": round(
-            net_profit_percent,
-            4
-        ),
+        "net_profit_percent":
+            round(
+                net_profit_percent,
+                4
+            ),
 
-        "net_profit_usd": round(
-            net_profit_usd,
-            2
-        ),
+        "net_profit_usd":
+            round(
+                net_profit_usd,
+                2
+            ),
 
         "buy_fee_percent":
             buy_fee_percent,
@@ -502,13 +606,19 @@ def scan_symbol(symbol):
         )
 
         if price_data:
-            prices[exchange_id] = price_data
+
+            prices[
+                exchange_id
+            ] = price_data
 
     opportunities = []
 
     for buy_exchange, buy_data in prices.items():
 
-        for sell_exchange, sell_data in prices.items():
+        for (
+            sell_exchange,
+            sell_data
+        ) in prices.items():
 
             if buy_exchange == sell_exchange:
                 continue
@@ -528,9 +638,12 @@ def scan_symbol(symbol):
             )
 
             if (
-                opportunity["net_profit_percent"]
+                opportunity[
+                    "net_profit_percent"
+                ]
                 >= MIN_NET_PROFIT_PERCENT
             ):
+
                 opportunities.append(
                     opportunity
                 )
@@ -544,11 +657,34 @@ def scan_symbol(symbol):
 
 def scan_all():
 
+    global current_symbol
+    global current_symbol_index
+    global current_scan_total
+
     all_opportunities = []
 
-    for symbol in SYMBOLS:
+    current_scan_total = len(
+        SYMBOLS
+    )
+
+    for index, symbol in enumerate(
+        SYMBOLS,
+        start=1
+    ):
+
+        with lock:
+
+            current_symbol = symbol
+
+            current_symbol_index = index
+
+        print(
+            f"🔍 Монета {index}/{len(SYMBOLS)}: "
+            f"{symbol}"
+        )
 
         try:
+
             opportunities = scan_symbol(
                 symbol
             )
@@ -558,10 +694,19 @@ def scan_all():
             )
 
         except Exception as e:
+
             print(
                 f"⚠️ Ошибка сканирования "
                 f"{symbol}: {e}"
             )
+
+    with lock:
+
+        current_symbol = None
+
+        current_symbol_index = len(
+            SYMBOLS
+        )
 
     all_opportunities.sort(
         key=lambda x:
@@ -595,7 +740,6 @@ def send_opportunity_to_telegram(
         )
     )
 
-    # Защита от повторного спама
     if (
         current_time - last_sent
         < NOTIFICATION_COOLDOWN
@@ -609,7 +753,9 @@ def send_opportunity_to_telegram(
     pending_opportunities[
         opportunity_id
     ] = {
-        "id": opportunity_id,
+
+        "id":
+            opportunity_id,
 
         "symbol":
             opportunity["symbol"],
@@ -649,16 +795,19 @@ def send_opportunity_to_telegram(
 💵 Ожидаемая прибыль:
 <b>+${opportunity['net_profit_usd']}</b>
 
-⚠️ После нажатия «ДА» цены будут
-проверены ещё раз.
+⚠️ После нажатия «ДА»
+цены будут проверены ещё раз.
 """
 
     reply_markup = {
+
         "inline_keyboard": [
             [
+
                 {
                     "text":
                         "✅ ДА — ПРОВЕРИТЬ",
+
                     "callback_data":
                         f"yes:{opportunity_id}",
                 },
@@ -666,6 +815,7 @@ def send_opportunity_to_telegram(
                 {
                     "text":
                         "❌ НЕТ",
+
                     "callback_data":
                         f"no:{opportunity_id}",
                 },
@@ -678,7 +828,10 @@ def send_opportunity_to_telegram(
         reply_markup
     )
 
-    if result and result.get("ok"):
+    if (
+        result
+        and result.get("ok")
+    ):
 
         last_sent_notifications[
             notification_key
@@ -694,8 +847,6 @@ def send_opportunity_to_telegram(
 
         return True
 
-    # Если сообщение не ушло —
-    # удаляем из ожидающих
     pending_opportunities.pop(
         opportunity_id,
         None
@@ -705,7 +856,7 @@ def send_opportunity_to_telegram(
 
 
 # ============================================================
-# ПОВТОРНАЯ ПРОВЕРКА ПОСЛЕ «ДА»
+# ПОВТОРНАЯ ПРОВЕРКА
 # ============================================================
 
 def recheck_opportunity(
@@ -717,6 +868,7 @@ def recheck_opportunity(
     )
 
     if not opportunity:
+
         return (
             None,
             "Возможность уже устарела."
@@ -728,6 +880,7 @@ def recheck_opportunity(
         - opportunity["created_at"]
         > 300
     ):
+
         pending_opportunities.pop(
             opportunity_id,
             None
@@ -776,18 +929,23 @@ def recheck_opportunity(
         )
     )
 
-    return current_opportunity, None
+    return (
+        current_opportunity,
+        None
+    )
 
 
 # ============================================================
-# ОБРАБОТКА КНОПОК
+# ОБРАБОТКА КНОПОК TELEGRAM
 # ============================================================
 
 def handle_callback(
     callback_query
 ):
 
-    callback_id = callback_query.get("id")
+    callback_id = callback_query.get(
+        "id"
+    )
 
     callback_data = callback_query.get(
         "data",
@@ -809,7 +967,7 @@ def handle_callback(
         )
     )
 
-    # Только владелец бота
+    # Только владелец может управлять ботом
     if chat_id != TELEGRAM_CHAT_ID:
 
         answer_callback_query(
@@ -834,6 +992,7 @@ def handle_callback(
             1
         )
     )
+
 
     # ========================================================
     # НЕТ
@@ -897,7 +1056,9 @@ def handle_callback(
             return
 
         if (
-            current["net_profit_percent"]
+            current[
+                "net_profit_percent"
+            ]
             < MIN_NET_PROFIT_PERCENT
         ):
 
@@ -970,17 +1131,19 @@ def telegram_polling():
 
         try:
 
+            request_data = {
+                "timeout": 20,
+            }
+
+            if offset is not None:
+
+                request_data[
+                    "offset"
+                ] = offset
+
             result = telegram_api(
                 "getUpdates",
-                {
-                    "timeout": 20,
-
-                    **(
-                        {"offset": offset}
-                        if offset is not None
-                        else {}
-                    ),
-                },
+                request_data,
                 request_method="GET",
             )
 
@@ -1004,7 +1167,8 @@ def telegram_polling():
             ):
 
                 offset = (
-                    update["update_id"] + 1
+                    update["update_id"]
+                    + 1
                 )
 
                 callback_query = (
@@ -1037,6 +1201,8 @@ def scanner_loop():
 
     global last_opportunities
     global last_scan_time
+    global total_scans
+    global total_opportunities_found
 
     print(
         "🔎 Арбитражный сканер запущен."
@@ -1047,8 +1213,22 @@ def scanner_loop():
         try:
 
             print(
-                f"🔄 Сканирование: "
+                ""
+            )
+
+            print(
+                f"🔄 НАЧАЛО СКАНИРОВАНИЯ "
                 f"{datetime.now().strftime('%H:%M:%S')}"
+            )
+
+            print(
+                f"🪙 Монет для проверки: "
+                f"{len(SYMBOLS)}"
+            )
+
+            print(
+                f"🏦 Подключено бирж: "
+                f"{len(exchanges)}"
             )
 
             opportunities = scan_all()
@@ -1061,6 +1241,12 @@ def scanner_loop():
 
                 last_scan_time = (
                     datetime.now()
+                )
+
+                total_scans += 1
+
+                total_opportunities_found += (
+                    len(opportunities)
                 )
 
             print(
@@ -1085,7 +1271,13 @@ def scanner_loop():
                 )
 
                 if sent:
+
                     sent_count += 1
+
+            print(
+                f"📨 Отправлено уведомлений: "
+                f"{sent_count}"
+            )
 
         except Exception as e:
 
@@ -1107,24 +1299,43 @@ def start_background_services():
 
     global scanner_started
     global telegram_started
+    global services_started
 
     with startup_lock:
 
-        # Защита от двойного запуска
-        if scanner_started:
+        # Защита от повторного запуска
+        if services_started:
             return
 
+        services_started = True
+
         print("")
-        print("==========================================")
-        print("🚀 ЗАПУСК АРБИТРАЖНОЙ СИСТЕМЫ")
-        print("==========================================")
+        print(
+            "=========================================="
+        )
+        print(
+            "🚀 ЗАПУСК АРБИТРАЖНОЙ СИСТЕМЫ"
+        )
+        print(
+            "=========================================="
+        )
+
+        print(
+            f"🪙 Всего монет: "
+            f"{len(SYMBOLS)}"
+        )
+
+        print(
+            f"🏦 Всего бирж: "
+            f"{len(exchanges)}"
+        )
 
         telegram_ok = (
             check_telegram_connection()
         )
 
-        # Запускаем Telegram polling
-        # только если токен и отправка работают
+
+        # Запускаем Telegram
         if telegram_ok:
 
             telegram_thread = (
@@ -1142,10 +1353,12 @@ def start_background_services():
         else:
 
             print(
-                "⚠️ Telegram polling не запущен."
+                "⚠️ Telegram polling "
+                "не запущен."
             )
 
-        # Сканер запускаем всегда
+
+        # Запускаем сканер
         scanner_thread = (
             threading.Thread(
                 target=scanner_loop,
@@ -1162,7 +1375,10 @@ def start_background_services():
             "✅ Фоновые сервисы запущены."
         )
 
-        print("==========================================")
+        print(
+            "=========================================="
+        )
+
         print("")
 
 
@@ -1189,7 +1405,7 @@ content="width=device-width, initial-scale=1.0"
 
 body {
     margin: 0;
-    padding: 25px;
+    padding: 20px;
     background: #0f1623;
     color: #e8edf5;
     font-family: Arial, sans-serif;
@@ -1204,29 +1420,57 @@ body {
     display: inline-block;
     background: #124d3d;
     color: #7de0bb;
-    padding: 18px 35px;
+    padding: 18px 28px;
     border-radius: 40px;
-    font-size: 22px;
-    margin-bottom: 25px;
+    font-size: 20px;
+    margin-bottom: 20px;
 }
 
 .card {
     background: #1d2939;
     border: 1px solid #31445f;
-    border-radius: 28px;
-    padding: 28px;
+    border-radius: 25px;
+    padding: 25px;
+    margin-bottom: 18px;
+    font-size: 20px;
+}
+
+.stats-grid {
+    display: grid;
+    grid-template-columns:
+        repeat(
+            auto-fit,
+            minmax(180px, 1fr)
+        );
+    gap: 15px;
     margin-bottom: 20px;
 }
 
-.number {
-    font-size: 58px;
+.stat-box {
+    background: #1d2939;
+    border: 1px solid #31445f;
+    border-radius: 25px;
+    padding: 22px;
+}
+
+.stat-number {
+    font-size: 38px;
     font-weight: bold;
     color: #66aaff;
 }
 
-.label {
-    font-size: 24px;
+.stat-label {
     color: #b8c2d2;
+    margin-top: 8px;
+    font-size: 17px;
+}
+
+.scanning {
+    background: #27395b;
+    border-radius: 20px;
+    padding: 20px;
+    margin-bottom: 20px;
+    font-size: 20px;
 }
 
 .opportunity {
@@ -1247,7 +1491,7 @@ body {
     background: #922321;
     padding: 22px;
     border-radius: 28px;
-    font-size: 25px;
+    font-size: 22px;
     margin-bottom: 20px;
 }
 
@@ -1265,13 +1509,21 @@ body {
 }
 
 .exchange {
-    font-size: 30px;
+    font-size: 27px;
     font-weight: bold;
+    margin-top: 8px;
 }
 
 .price {
-    font-size: 27px;
+    font-size: 24px;
     margin-top: 10px;
+}
+
+.empty {
+    text-align: center;
+    padding: 40px 20px;
+    color: #b8c2d2;
+    font-size: 20px;
 }
 
 </style>
@@ -1282,9 +1534,96 @@ body {
 
 <div class="container">
 
+
 <div class="status">
-🟢 Сканер активен
+🟢 Арбитражный сканер активен
 </div>
+
+
+<div class="stats-grid">
+
+<div class="stat-box">
+
+<div class="stat-number">
+{{ total_coins }}
+</div>
+
+<div class="stat-label">
+🪙 Всего монет
+</div>
+
+</div>
+
+
+<div class="stat-box">
+
+<div class="stat-number">
+{{ exchanges_count }}
+</div>
+
+<div class="stat-label">
+🏦 Бирж подключено
+</div>
+
+</div>
+
+
+<div class="stat-box">
+
+<div class="stat-number">
+{{ current_index }}/{{ total_coins }}
+</div>
+
+<div class="stat-label">
+🔍 Прогресс сканирования
+</div>
+
+</div>
+
+
+<div class="stat-box">
+
+<div class="stat-number">
+{{ opportunities|length }}
+</div>
+
+<div class="stat-label">
+📈 Возможностей найдено
+</div>
+
+</div>
+
+</div>
+
+
+<div class="scanning">
+
+{% if current_symbol %}
+
+🔍 Сейчас сканируется:
+
+<b>{{ current_symbol }}</b>
+
+<br><br>
+
+📊 Монета
+<b>{{ current_index }}</b>
+из
+<b>{{ total_coins }}</b>
+
+{% else %}
+
+⏳ Ожидание следующего сканирования
+
+<br><br>
+
+🪙 Всего монет:
+<b>{{ total_coins }}</b>
+
+{% endif %}
+
+</div>
+
 
 <div class="card">
 
@@ -1293,13 +1632,23 @@ body {
 
 <br><br>
 
-💸 Сделка:
+💸 Размер сделки:
 <b>${{ trade_amount }}</b>
 
 <br><br>
 
-🔄 Обновление каждые
+🔄 Новый скан каждые:
 <b>{{ interval }} секунд</b>
+
+<br><br>
+
+🏦 Задействовано бирж:
+<b>{{ exchanges_count }}</b>
+
+<br><br>
+
+🪙 Общее количество монет:
+<b>{{ total_coins }}</b>
 
 <br><br>
 
@@ -1308,49 +1657,52 @@ body {
 
 <br><br>
 
+🔄 Всего выполнено сканов:
+<b>{{ total_scans }}</b>
+
+<br><br>
+
+📊 Всего найдено возможностей:
+<b>{{ total_found }}</b>
+
+<br><br>
+
 🕒 Последний скан:
 {{ last_scan }}
 
 </div>
 
-<div class="card">
 
-<div class="number">
-{{ opportunities|length }}
-</div>
-
-<div class="label">
-Возможностей найдено
-</div>
-
-</div>
+{% if opportunities %}
 
 {% for op in opportunities %}
 
 <div class="opportunity">
 
 <div class="symbol">
-{{ op.symbol }}
+🪙 {{ op.symbol }}
 </div>
+
 
 <div class="profit">
 
 <b>
-Чистая:
+📈 Чистая прибыль:
 +{{ op.net_profit_percent }}%
 </b>
 
 <br><br>
 
-Валовый спред:
+📊 Валовый спред:
 +{{ op.gross_spread_percent }}%
 
 <br><br>
 
 💰 Результат на ${{ trade_amount }}:
-${{ op.net_profit_usd }}
+<b>${{ op.net_profit_usd }}</b>
 
 </div>
+
 
 <div class="buy">
 
@@ -1365,6 +1717,7 @@ ${{ op.buy_price }}
 </div>
 
 </div>
+
 
 <div class="sell">
 
@@ -1384,13 +1737,34 @@ ${{ op.sell_price }}
 
 {% endfor %}
 
+{% else %}
+
+<div class="card empty">
+
+🔎 Пока подходящих возможностей нет.
+
+<br><br>
+
+Бот продолжает искать среди
+<b>{{ total_coins }}</b> монет
+на <b>{{ exchanges_count }}</b> биржах.
+
 </div>
+
+{% endif %}
+
+
+</div>
+
 
 <script>
 
-setTimeout(() => {
-    location.reload();
-}, {{ interval * 1000 }});
+setTimeout(
+    () => {
+        location.reload();
+    },
+    {{ interval * 1000 }}
+);
 
 </script>
 
@@ -1400,7 +1774,7 @@ setTimeout(() => {
 
 
 # ============================================================
-# ROUTES
+# ГЛАВНАЯ СТРАНИЦА
 # ============================================================
 
 @app.route("/")
@@ -1416,16 +1790,32 @@ def index():
 
         scan_time = last_scan_time
 
+        current = current_symbol
+
+        current_index = (
+            current_symbol_index
+        )
+
+        scans = total_scans
+
+        found = (
+            total_opportunities_found
+        )
+
     return render_template_string(
+
         HTML,
 
         opportunities=opportunities,
 
-        min_profit=MIN_NET_PROFIT_PERCENT,
+        min_profit=
+            MIN_NET_PROFIT_PERCENT,
 
-        trade_amount=TRADE_AMOUNT_USD,
+        trade_amount=
+            TRADE_AMOUNT_USD,
 
-        interval=SCAN_INTERVAL,
+        interval=
+            SCAN_INTERVAL,
 
         telegram_status=(
             "🟢 подключён"
@@ -1433,15 +1823,38 @@ def index():
             else "🔴 не подключён"
         ),
 
+        exchanges_count=
+            len(exchanges),
+
+        total_coins=
+            len(SYMBOLS),
+
+        current_symbol=
+            current,
+
+        current_index=
+            current_index,
+
+        total_scans=
+            scans,
+
+        total_found=
+            found,
+
         last_scan=(
             scan_time.strftime(
                 "%d.%m.%Y %H:%M:%S"
             )
             if scan_time
-            else "Ожидание первого скана"
+            else
+            "Ожидание первого скана"
         ),
     )
 
+
+# ============================================================
+# API СКАНИРОВАНИЯ
+# ============================================================
 
 @app.route("/scan")
 def scan_api():
@@ -1456,22 +1869,61 @@ def scan_api():
 
         scan_time = last_scan_time
 
+        current = current_symbol
+
+        current_index = (
+            current_symbol_index
+        )
+
+        scans = total_scans
+
+        found = (
+            total_opportunities_found
+        )
+
     return jsonify({
 
-        "status": "success",
+        "status":
+            "success",
 
-        "scan_active": scanner_started,
+        "scan_active":
+            scanner_started,
 
         "telegram_active":
             telegram_started,
 
-        "symbols": SYMBOLS,
+        "total_coins":
+            len(SYMBOLS),
+
+        "symbols":
+            SYMBOLS,
+
+        "exchanges_count":
+            len(exchanges),
+
+        "exchanges":
+            list(exchanges.keys()),
+
+        "currently_scanning":
+            current,
+
+        "current_coin_number":
+            current_index,
+
+        "scan_progress":
+            f"{current_index}/{len(SYMBOLS)}",
 
         "trade_amount":
             TRADE_AMOUNT_USD,
 
         "min_net_profit_percent":
             MIN_NET_PROFIT_PERCENT,
+
+        "total_scans":
+            scans,
+
+        "total_opportunities_found":
+            found,
 
         "last_scan": (
             scan_time.isoformat()
@@ -1484,6 +1936,10 @@ def scan_api():
     })
 
 
+# ============================================================
+# HEALTH
+# ============================================================
+
 @app.route("/health")
 def health():
 
@@ -1491,7 +1947,8 @@ def health():
 
     return jsonify({
 
-        "status": "ok",
+        "status":
+            "ok",
 
         "scanner":
             scanner_started,
@@ -1507,11 +1964,35 @@ def health():
         "min_profit":
             MIN_NET_PROFIT_PERCENT,
 
+        "trade_amount":
+            TRADE_AMOUNT_USD,
+
+        "total_coins":
+            len(SYMBOLS),
+
         "symbols_count":
             len(SYMBOLS),
 
         "exchanges_count":
             len(exchanges),
+
+        "exchanges":
+            list(exchanges.keys()),
+
+        "currently_scanning":
+            current_symbol,
+
+        "current_coin_number":
+            current_symbol_index,
+
+        "scan_progress":
+            f"{current_symbol_index}/{len(SYMBOLS)}",
+
+        "total_scans":
+            total_scans,
+
+        "total_opportunities_found":
+            total_opportunities_found,
     })
 
 
@@ -1520,13 +2001,6 @@ def health():
 # ============================================================
 
 if __name__ == "__main__":
-
-    # Важно:
-    # Railway Start Command лучше поставить:
-    #
-    # python app.py
-    #
-    # Тогда всё запустится сразу.
 
     start_background_services()
 
