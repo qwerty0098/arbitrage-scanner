@@ -1,7 +1,12 @@
 from flask import Flask, jsonify, render_template_string
 import ccxt
+import os
 
 app = Flask(__name__)
+
+# =========================
+# НАСТРОЙКИ
+# =========================
 
 exchange_names = [
     "kraken",
@@ -17,6 +22,21 @@ symbols = [
     "XRP/USDT",
 ]
 
+# Минимальная чистая прибыль после торговых комиссий
+MIN_NET_SPREAD_PERCENT = 0.10
+
+# Интервал автоматического обновления страницы
+REFRESH_SECONDS = 15
+
+# Примерные комиссии за обычную сделку.
+# Можно изменить позже на актуальные комиссии твоих аккаунтов.
+EXCHANGE_FEES = {
+    "kraken": 0.0026,   # 0.26%
+    "kucoin": 0.0010,   # 0.10%
+    "bitget": 0.0010,   # 0.10%
+    "bybit": 0.0010,    # 0.10%
+}
+
 
 def get_exchange(name):
     exchange_class = getattr(ccxt, name)
@@ -31,6 +51,7 @@ def get_opportunities():
     results = []
     all_prices = []
 
+    # Получаем цены со всех бирж
     for exchange_name in exchange_names:
         try:
             exchange = get_exchange(exchange_name)
@@ -42,7 +63,7 @@ def get_opportunities():
                     bid = ticker.get("bid")
                     ask = ticker.get("ask")
 
-                    if bid and ask:
+                    if bid and ask and bid > 0 and ask > 0:
                         all_prices.append({
                             "exchange": exchange_name,
                             "symbol": symbol,
@@ -56,7 +77,9 @@ def get_opportunities():
         except Exception:
             continue
 
+    # Ищем арбитражные возможности
     for symbol in symbols:
+
         prices = [
             item for item in all_prices
             if item["symbol"] == symbol
@@ -65,28 +88,84 @@ def get_opportunities():
         if len(prices) < 2:
             continue
 
-        buy_exchange = min(prices, key=lambda x: x["ask"])
-        sell_exchange = max(prices, key=lambda x: x["bid"])
+        # Самая низкая цена покупки
+        buy_exchange = min(
+            prices,
+            key=lambda x: x["ask"]
+        )
+
+        # Самая высокая цена продажи
+        sell_exchange = max(
+            prices,
+            key=lambda x: x["bid"]
+        )
+
+        # Не считаем сделку внутри одной биржи
+        if buy_exchange["exchange"] == sell_exchange["exchange"]:
+            continue
 
         buy_price = buy_exchange["ask"]
         sell_price = sell_exchange["bid"]
 
+        # Валовой спред без комиссий
         gross_spread = (
             (sell_price - buy_price) / buy_price
         ) * 100
 
-        if gross_spread > 0:
+        # Комиссия при покупке
+        buy_fee = EXCHANGE_FEES.get(
+            buy_exchange["exchange"],
+            0.001
+        )
+
+        # Комиссия при продаже
+        sell_fee = EXCHANGE_FEES.get(
+            sell_exchange["exchange"],
+            0.001
+        )
+
+        # Общая комиссия в процентах
+        total_fees_percent = (
+            buy_fee + sell_fee
+        ) * 100
+
+        # Чистый спред после торговых комиссий
+        net_spread = (
+            gross_spread - total_fees_percent
+        )
+
+        # Показываем только возможности
+        # выше минимальной чистой прибыли
+        if net_spread >= MIN_NET_SPREAD_PERCENT:
+
             results.append({
                 "symbol": symbol,
+
                 "buy_exchange": buy_exchange["exchange"].upper(),
-                "buy_price": round(buy_price, 4),
+                "buy_price": round(buy_price, 6),
+
                 "sell_exchange": sell_exchange["exchange"].upper(),
-                "sell_price": round(sell_price, 4),
-                "gross_spread_percent": round(gross_spread, 3)
+                "sell_price": round(sell_price, 6),
+
+                "gross_spread_percent": round(
+                    gross_spread,
+                    3
+                ),
+
+                "total_fees_percent": round(
+                    total_fees_percent,
+                    3
+                ),
+
+                "net_spread_percent": round(
+                    net_spread,
+                    3
+                )
             })
 
+    # Самые выгодные возможности сверху
     results.sort(
-        key=lambda x: x["gross_spread_percent"],
+        key=lambda x: x["net_spread_percent"],
         reverse=True
     )
 
@@ -100,14 +179,20 @@ def home():
     return render_template_string("""
 <!DOCTYPE html>
 <html lang="ru">
+
 <head>
     <meta charset="UTF-8">
-    <meta http-equiv="refresh" content="30">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <meta http-equiv="refresh"
+          content="{{ refresh_seconds }}">
+
+    <meta name="viewport"
+          content="width=device-width, initial-scale=1.0">
 
     <title>Arbitrage Scanner</title>
 
     <style>
+
         * {
             box-sizing: border-box;
         }
@@ -132,16 +217,26 @@ def home():
 
         .subtitle {
             color: #9ca3af;
-            margin-bottom: 30px;
+            margin-bottom: 20px;
         }
 
         .status {
             display: inline-block;
             background: #064e3b;
             color: #6ee7b7;
-            padding: 8px 14px;
+            padding: 10px 16px;
             border-radius: 20px;
             margin-bottom: 25px;
+        }
+
+        .settings {
+            background: #111827;
+            border: 1px solid #1f2937;
+            border-radius: 14px;
+            padding: 14px;
+            color: #9ca3af;
+            margin-bottom: 25px;
+            font-size: 14px;
         }
 
         .stats {
@@ -181,7 +276,8 @@ def home():
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 20px;
+            margin-bottom: 12px;
+            gap: 15px;
         }
 
         .symbol {
@@ -195,6 +291,13 @@ def home():
             padding: 8px 14px;
             border-radius: 20px;
             font-weight: bold;
+            white-space: nowrap;
+        }
+
+        .details {
+            color: #9ca3af;
+            font-size: 13px;
+            margin-bottom: 20px;
         }
 
         .trade-row {
@@ -238,6 +341,7 @@ def home():
             padding: 40px;
             border-radius: 16px;
             color: #9ca3af;
+            border: 1px solid #1f2937;
         }
 
         .footer {
@@ -247,7 +351,12 @@ def home():
             font-size: 14px;
         }
 
+        a {
+            color: #60a5fa;
+        }
+
         @media (max-width: 600px) {
+
             body {
                 padding: 15px;
             }
@@ -263,11 +372,18 @@ def home():
             h1 {
                 font-size: 26px;
             }
+
+            .card-header {
+                align-items: flex-start;
+                flex-direction: column;
+            }
         }
+
     </style>
 </head>
 
 <body>
+
 <div class="container">
 
     <h1>🚀 Arbitrage Scanner</h1>
@@ -280,16 +396,38 @@ def home():
         ● Сканер активен
     </div>
 
+    <div class="settings">
+        🎯 Минимальная чистая прибыль:
+        {{ min_net_spread }}%
+        <br>
+        💸 Торговые комиссии учитываются
+        <br>
+        🔄 Обновление каждые
+        {{ refresh_seconds }} секунд
+    </div>
+
     <div class="stats">
+
         <div class="stat">
-            <div class="stat-value">{{ opportunities|length }}</div>
-            <div class="stat-label">Возможностей найдено</div>
+            <div class="stat-value">
+                {{ opportunities|length }}
+            </div>
+
+            <div class="stat-label">
+                Возможностей найдено
+            </div>
         </div>
 
         <div class="stat">
-            <div class="stat-value">{{ prices|length }}</div>
-            <div class="stat-label">Цен проверено</div>
+            <div class="stat-value">
+                {{ prices|length }}
+            </div>
+
+            <div class="stat-label">
+                Цен проверено
+            </div>
         </div>
+
     </div>
 
     {% if opportunities %}
@@ -299,35 +437,58 @@ def home():
         <div class="card">
 
             <div class="card-header">
+
                 <div class="symbol">
                     {{ item.symbol }}
                 </div>
 
                 <div class="spread">
-                    +{{ item.gross_spread_percent }}%
+                    Чистая прибыль:
+                    +{{ item.net_spread_percent }}%
                 </div>
+
+            </div>
+
+            <div class="details">
+                Валовой спред:
+                {{ item.gross_spread_percent }}%
+                &nbsp;•&nbsp;
+                Комиссии:
+                {{ item.total_fees_percent }}%
             </div>
 
             <div class="trade-row">
 
                 <div class="buy">
-                    <div class="label">🟢 КУПИТЬ</div>
+
+                    <div class="label">
+                        🟢 КУПИТЬ
+                    </div>
+
                     <div class="exchange">
                         {{ item.buy_exchange }}
                     </div>
+
                     <div class="price">
                         ${{ item.buy_price }}
                     </div>
+
                 </div>
 
                 <div class="sell">
-                    <div class="label">🔴 ПРОДАТЬ</div>
+
+                    <div class="label">
+                        🔴 ПРОДАТЬ
+                    </div>
+
                     <div class="exchange">
                         {{ item.sell_exchange }}
                     </div>
+
                     <div class="price">
                         ${{ item.sell_price }}
                     </div>
+
                 </div>
 
             </div>
@@ -339,22 +500,45 @@ def home():
     {% else %}
 
         <div class="empty">
-            🔍 Сейчас подходящих ценовых расхождений не найдено.
+
+            🔍 Сейчас нет возможностей с чистой
+            прибылью от {{ min_net_spread }}%.
+
             <br><br>
-            Страница обновится автоматически через 30 секунд.
+
+            Учитываются торговые комиссии.
+
+            <br><br>
+
+            Страница обновится автоматически через
+            {{ refresh_seconds }} секунд.
+
         </div>
 
     {% endif %}
 
     <div class="footer">
-        Данные обновляются автоматически каждые 30 секунд •
-        <a href="/scan" style="color:#60a5fa;">JSON API</a>
+
+        Данные обновляются каждые
+        {{ refresh_seconds }} секунд
+
+        •
+        <a href="/scan">
+            JSON API
+        </a>
+
     </div>
 
 </div>
+
 </body>
 </html>
-    """, opportunities=opportunities, prices=prices)
+    """,
+        opportunities=opportunities,
+        prices=prices,
+        min_net_spread=MIN_NET_SPREAD_PERCENT,
+        refresh_seconds=REFRESH_SECONDS
+    )
 
 
 @app.route("/scan")
@@ -362,16 +546,20 @@ def scan():
     opportunities, prices = get_opportunities()
 
     return jsonify({
+        "scanner_active": True,
+        "min_net_spread_percent": MIN_NET_SPREAD_PERCENT,
         "opportunities_found": len(opportunities),
         "opportunities": opportunities,
+        "prices_checked_count": len(prices),
         "prices_checked": prices
     })
 
 
 if __name__ == "__main__":
-    import os
 
-    port = int(os.environ.get("PORT", 10000))
+    port = int(
+        os.environ.get("PORT", 10000)
+    )
 
     app.run(
         host="0.0.0.0",
