@@ -21,10 +21,6 @@ symbols = [
     "ETH/USDT",
     "SOL/USDT",
     "XRP/USDT",
-    "ADA/USDT",
-    "DOGE/USDT",
-    "AVAX/USDT",
-    "LINK/USDT",
 ]
 
 # Размер условной сделки для расчёта прибыли
@@ -48,7 +44,7 @@ def get_exchange(name):
 
     return exchange_class({
         "enableRateLimit": True,
-        "timeout": 10000,
+        "timeout": 5000,
     })
 
 
