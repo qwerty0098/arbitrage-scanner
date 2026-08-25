@@ -3,7 +3,7 @@ import ccxt
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from itertools import permutations
 
 app = Flask(__name__)
 
@@ -19,44 +19,36 @@ EXCHANGE_NAMES = [
     "bybit",
 ]
 
-
 # 8 монет
 SYMBOLS = [
     "BTC/USDT",
     "ETH/USDT",
     "SOL/USDT",
     "XRP/USDT",
-    "ADA/USDT",
+    "BNB/USDT",
     "DOGE/USDT",
+    "ADA/USDT",
     "AVAX/USDT",
-    "LINK/USDT",
 ]
-
 
 # Как часто запускать новый скан
 SCAN_INTERVAL = 15
 
-
 # Таймаут запросов к биржам
 REQUEST_TIMEOUT = 8000
 
-
-# Комиссия на покупку — 0.1%
+# Комиссия на покупку
 BUY_FEE = 0.001
 
-
-# Комиссия на продажу — 0.1%
+# Комиссия на продажу
 SELL_FEE = 0.001
 
+# Минимальная ЧИСТАЯ прибыль после комиссий
+# 0.01 = минимум +0.01%
+MIN_NET_PROFIT = 0.01
 
-# Текущий фильтр чистой прибыли.
-# -0.2 означает, что показываются также небольшие отрицательные спреды.
-MIN_NET_PROFIT = -0.5
-
-
-# Сумма для расчёта сделки
+# Сумма расчёта сделки
 TRADE_AMOUNT = 1000
-
 
 # Максимальное количество потоков
 MAX_WORKERS = 4
@@ -76,7 +68,6 @@ scanner_state = {
     "error": None,
     "diagnostics": {},
 }
-
 
 state_lock = threading.Lock()
 scan_lock = threading.Lock()
@@ -126,7 +117,6 @@ def scan_exchange(exchange_name):
 
             try:
 
-                # Проверяем, существует ли такая торговая пара
                 if symbol not in markets:
 
                     diagnostic["errors"].append(
@@ -135,14 +125,11 @@ def scan_exchange(exchange_name):
 
                     continue
 
-
                 ticker = exchange.fetch_ticker(symbol)
 
                 bid = ticker.get("bid")
                 ask = ticker.get("ask")
 
-
-                # Если биржа не вернула bid или ask
                 if bid is None or ask is None:
 
                     diagnostic["errors"].append(
@@ -151,10 +138,8 @@ def scan_exchange(exchange_name):
 
                     continue
 
-
                 bid = float(bid)
                 ask = float(ask)
-
 
                 if bid <= 0 or ask <= 0:
 
@@ -164,7 +149,6 @@ def scan_exchange(exchange_name):
 
                     continue
 
-
                 results.append({
                     "exchange": exchange_name,
                     "symbol": symbol,
@@ -172,27 +156,18 @@ def scan_exchange(exchange_name):
                     "ask": ask,
                 })
 
-
             except Exception as error:
 
                 diagnostic["errors"].append(
                     f"{symbol}: {str(error)[:120]}"
                 )
 
-                continue
-
-
         diagnostic["prices_received"] = len(results)
 
-
-        if len(results) > 0:
-
+        if results:
             diagnostic["status"] = "success"
-
         else:
-
             diagnostic["status"] = "no_prices"
-
 
     except Exception as error:
 
@@ -201,7 +176,6 @@ def scan_exchange(exchange_name):
         diagnostic["errors"].append(
             str(error)[:200]
         )
-
 
     finally:
 
@@ -213,12 +187,77 @@ def scan_exchange(exchange_name):
         except Exception:
             pass
 
-
     return results, diagnostic
 
 
 # =========================================================
-# ПОЛНЫЙ СКАН ВСЕХ БИРЖ
+# РАСЧЁТ АРБИТРАЖНОЙ СДЕЛКИ
+# =========================================================
+
+def calculate_trade(buy_price, sell_price):
+
+    # Сколько USDT реально уходит на покупку
+    total_buy_cost = TRADE_AMOUNT
+
+    # Сумма самой покупки без комиссии
+    amount_before_fee = (
+        total_buy_cost
+        / (1 + BUY_FEE)
+    )
+
+    # Количество монет, которое покупаем
+    coins_bought = (
+        amount_before_fee
+        / buy_price
+    )
+
+    # Сколько получаем после продажи
+    gross_revenue = (
+        coins_bought
+        * sell_price
+    )
+
+    # Выручка после комиссии продажи
+    net_revenue = (
+        gross_revenue
+        * (1 - SELL_FEE)
+    )
+
+    # Чистая прибыль в USDT
+    profit_usdt = (
+        net_revenue
+        - TRADE_AMOUNT
+    )
+
+    # Чистая прибыль в процентах
+    net_profit_percent = (
+        profit_usdt
+        / TRADE_AMOUNT
+    ) * 100
+
+    # Валовый спред без комиссий
+    gross_spread_percent = (
+        (sell_price - buy_price)
+        / buy_price
+    ) * 100
+
+    return {
+        "gross_spread_percent":
+            gross_spread_percent,
+
+        "net_profit_percent":
+            net_profit_percent,
+
+        "profit_usdt":
+            profit_usdt,
+
+        "coins_bought":
+            coins_bought,
+    }
+
+
+# =========================================================
+# ПОИСК ВСЕХ АРБИТРАЖНЫХ ВОЗМОЖНОСТЕЙ
 # =========================================================
 
 def get_opportunities():
@@ -226,14 +265,11 @@ def get_opportunities():
     all_prices = []
     diagnostics = {}
 
-
     with ThreadPoolExecutor(
         max_workers=MAX_WORKERS
     ) as executor:
 
-
         futures = {
-
             executor.submit(
                 scan_exchange,
                 exchange_name
@@ -242,7 +278,6 @@ def get_opportunities():
             for exchange_name
             in EXCHANGE_NAMES
         }
-
 
         for future in as_completed(futures):
 
@@ -254,12 +289,15 @@ def get_opportunities():
 
                 all_prices.extend(prices)
 
-                diagnostics[exchange_name] = diagnostic
-
+                diagnostics[
+                    exchange_name
+                ] = diagnostic
 
             except Exception as error:
 
-                diagnostics[exchange_name] = {
+                diagnostics[
+                    exchange_name
+                ] = {
                     "status": "future_error",
                     "prices_received": 0,
                     "errors": [
@@ -267,158 +305,133 @@ def get_opportunities():
                     ],
                 }
 
-
     opportunities = []
 
-
     # =====================================================
-    # ИЩЕМ ЛУЧШУЮ ПОКУПКУ И ЛУЧШУЮ ПРОДАЖУ
+    # ПРОВЕРЯЕМ ВСЕ КОМБИНАЦИИ БИРЖ
     # =====================================================
 
     for symbol in SYMBOLS:
 
-
         symbol_prices = [
-
             item
-
             for item in all_prices
-
             if item["symbol"] == symbol
         ]
 
-
-        # Нужно минимум две биржи
         if len(symbol_prices) < 2:
             continue
 
+        best_opportunity = None
 
-        # Самая дешёвая покупка по ASK
-        buy_exchange = min(
+        # Проверяем каждую комбинацию:
+        # купить на одной бирже -> продать на другой
+        for buy_exchange, sell_exchange in permutations(
             symbol_prices,
-            key=lambda x: x["ask"]
-        )
-
-
-        # Самая дорогая продажа по BID
-        sell_exchange = max(
-            symbol_prices,
-            key=lambda x: x["bid"]
-        )
-
-
-        # Не учитываем покупку и продажу на одной бирже
-        if (
-            buy_exchange["exchange"]
-            == sell_exchange["exchange"]
+            2
         ):
-            continue
 
+            if (
+                buy_exchange["exchange"]
+                == sell_exchange["exchange"]
+            ):
+                continue
 
-        buy_price = buy_exchange["ask"]
-        sell_price = sell_exchange["bid"]
+            buy_price = buy_exchange["ask"]
+            sell_price = sell_exchange["bid"]
 
+            trade = calculate_trade(
+                buy_price,
+                sell_price
+            )
 
-        # =================================================
-        # ВАЛОВЫЙ СПРЕД
-        # =================================================
+            # ВАЖНО:
+            # Пропускаем всё, что не приносит
+            # минимальную чистую прибыль
+            if (
+                trade["net_profit_percent"]
+                < MIN_NET_PROFIT
+            ):
+                continue
 
-        gross_spread = (
-            (sell_price - buy_price)
-            / buy_price
-        ) * 100
-
-
-        # =================================================
-        # РАСЧЁТ С УЧЁТОМ КОМИССИЙ
-        # =================================================
-
-        # Реальная стоимость покупки с комиссией
-        buy_cost = (
-            buy_price
-            * (1 + BUY_FEE)
-        )
-
-
-        # Реальный доход после продажи с комиссией
-        sell_revenue = (
-            sell_price
-            * (1 - SELL_FEE)
-        )
-
-
-        # Чистая прибыль в процентах
-        net_profit_percent = (
-            (sell_revenue - buy_cost)
-            / buy_cost
-        ) * 100
-
-
-        # =================================================
-        # РАСЧЁТ ПРИБЫЛИ НА $1000
-        # =================================================
-
-        coins_bought = (
-            TRADE_AMOUNT
-            / buy_cost
-        )
-
-
-        final_amount = (
-            coins_bought
-            * sell_revenue
-        )
-
-
-        net_profit_usd = (
-            final_amount
-            - TRADE_AMOUNT
-        )
-
-
-        # =================================================
-        # ФИЛЬТР
-        # =================================================
-
-        if net_profit_percent >= MIN_NET_PROFIT:
-
-            opportunities.append({
-
+            opportunity = {
                 "symbol": symbol,
 
                 "buy_exchange":
-                    buy_exchange["exchange"].upper(),
+                    buy_exchange[
+                        "exchange"
+                    ].upper(),
 
                 "buy_price":
                     round(buy_price, 8),
 
                 "sell_exchange":
-                    sell_exchange["exchange"].upper(),
+                    sell_exchange[
+                        "exchange"
+                    ].upper(),
 
                 "sell_price":
                     round(sell_price, 8),
 
                 "gross_spread_percent":
-                    round(gross_spread, 4),
+                    round(
+                        trade[
+                            "gross_spread_percent"
+                        ],
+                        4
+                    ),
 
                 "net_profit_percent":
-                    round(net_profit_percent, 4),
+                    round(
+                        trade[
+                            "net_profit_percent"
+                        ],
+                        4
+                    ),
 
-                "net_profit_usd":
-                    round(net_profit_usd, 2),
+                "profit_usdt":
+                    round(
+                        trade[
+                            "profit_usdt"
+                        ],
+                        2
+                    ),
 
-            })
+                "coins_bought":
+                    round(
+                        trade[
+                            "coins_bought"
+                        ],
+                        8
+                    ),
+            }
 
+            # Для каждой монеты оставляем
+            # только самую прибыльную комбинацию
+            if (
+                best_opportunity is None
+                or opportunity[
+                    "net_profit_percent"
+                ] > best_opportunity[
+                    "net_profit_percent"
+                ]
+            ):
 
-    # Сначала самые выгодные
+                best_opportunity = opportunity
+
+        # Добавляем только реально прибыльную сделку
+        if best_opportunity is not None:
+
+            opportunities.append(
+                best_opportunity
+            )
+
+    # Самые прибыльные сверху
     opportunities.sort(
-
-        key=lambda x:
-            x["net_profit_percent"],
-
+        key=lambda item:
+            item["net_profit_percent"],
         reverse=True
     )
-
 
     return (
         opportunities,
@@ -433,34 +446,33 @@ def get_opportunities():
 
 def run_scan():
 
-    # Не даём двум сканам работать одновременно
     if not scan_lock.acquire(
         blocking=False
     ):
         return
-
 
     try:
 
         with state_lock:
 
             scanner_state["status"] = "scanning"
-
             scanner_state["error"] = None
 
-
-        opportunities, prices, diagnostics = (
-            get_opportunities()
-        )
-
+        (
+            opportunities,
+            prices,
+            diagnostics
+        ) = get_opportunities()
 
         with state_lock:
 
-            scanner_state["opportunities"] = (
-                opportunities
-            )
+            scanner_state[
+                "opportunities"
+            ] = opportunities
 
-            scanner_state["prices"] = prices
+            scanner_state[
+                "prices"
+            ] = prices
 
             scanner_state[
                 "opportunities_found"
@@ -474,16 +486,15 @@ def run_scan():
                 "diagnostics"
             ] = diagnostics
 
-            scanner_state["last_scan"] = (
-                time.strftime(
-                    "%d.%m.%Y %H:%M:%S"
-                )
+            scanner_state[
+                "last_scan"
+            ] = time.strftime(
+                "%d.%m.%Y %H:%M:%S"
             )
 
             scanner_state["status"] = "active"
 
             scanner_state["error"] = None
-
 
     except Exception as error:
 
@@ -491,8 +502,9 @@ def run_scan():
 
             scanner_state["status"] = "error"
 
-            scanner_state["error"] = str(error)
-
+            scanner_state["error"] = str(
+                error
+            )
 
     finally:
 
@@ -505,9 +517,7 @@ def run_scan():
 
 def scanner_loop():
 
-    # Первый скан сразу
     run_scan()
-
 
     while True:
 
@@ -538,7 +548,6 @@ def home():
     with state_lock:
 
         data = {
-
             "status":
                 scanner_state["status"],
 
@@ -579,22 +588,12 @@ def home():
             "min_net_profit":
                 MIN_NET_PROFIT,
 
-            "buy_fee":
-                BUY_FEE * 100,
-
-            "sell_fee":
-                SELL_FEE * 100,
-
             "trade_amount":
                 TRADE_AMOUNT,
 
             "scan_interval":
                 SCAN_INTERVAL,
-
-            "symbols_count":
-                len(SYMBOLS),
         }
-
 
     return render_template_string(
         """
@@ -612,7 +611,6 @@ def home():
 
 <title>Arbitrage Scanner</title>
 
-
 <style>
 
 * {
@@ -628,7 +626,6 @@ body {
         sans-serif;
 
     background: #0b0f19;
-
     color: #f8fafc;
 }
 
@@ -650,13 +647,9 @@ h1 {
 
 .status {
     display: inline-block;
-
     padding: 12px 20px;
-
     border-radius: 30px;
-
     font-size: 18px;
-
     margin-bottom: 25px;
 }
 
@@ -677,135 +670,84 @@ h1 {
 }
 
 .info-box {
-
     background: #151e2e;
-
     border: 1px solid #26364f;
-
     border-radius: 20px;
-
     padding: 22px;
-
     margin-bottom: 25px;
-
     color: #aeb8c8;
-
     font-size: 18px;
-
     line-height: 1.8;
 }
 
 .stats {
-
     display: flex;
-
     gap: 20px;
-
     margin-bottom: 25px;
 }
 
 .stat {
-
     flex: 1;
-
     background: #151e2e;
-
     border: 1px solid #26364f;
-
     border-radius: 20px;
-
     padding: 25px;
 }
 
 .stat-value {
-
     font-size: 44px;
-
     font-weight: bold;
-
     color: #60a5fa;
 }
 
 .stat-label {
-
     color: #aeb8c8;
-
     font-size: 18px;
-
     margin-top: 10px;
 }
 
 .card {
-
     background: #151e2e;
-
     border: 1px solid #26364f;
-
     border-radius: 20px;
-
     padding: 25px;
-
     margin-bottom: 20px;
 }
 
 .symbol {
-
-    font-size: 32px;
-
+    font-size: 30px;
     font-weight: bold;
-
     margin-bottom: 20px;
 }
 
 .profit-box {
-
-    padding: 18px 20px;
-
+    background: #064e3b;
+    color: #6ee7b7;
     border-radius: 18px;
-
+    padding: 18px;
     margin-bottom: 20px;
 }
 
-.profit-box.positive {
-
-    background: #065f46;
-}
-
-.profit-box.negative {
-
-    background: #7f1d1d;
-}
-
-.profit-main {
-
-    font-size: 25px;
-
+.net-profit {
+    font-size: 26px;
     font-weight: bold;
 }
 
-.profit-sub {
-
-    margin-top: 10px;
-
-    font-size: 17px;
-
-    color: #d1d5db;
+.gross-profit {
+    margin-top: 8px;
+    font-size: 18px;
+    color: #a7f3d0;
 }
 
 .trade-row {
-
     display: grid;
-
     grid-template-columns: 1fr 1fr;
-
     gap: 18px;
 }
 
 .buy,
 .sell {
-
     padding: 20px;
-
     border-radius: 16px;
 }
 
@@ -818,82 +760,54 @@ h1 {
 }
 
 .label {
-
     color: #b7c0d0;
-
     font-size: 16px;
-
     margin-bottom: 10px;
 }
 
 .exchange {
-
     font-size: 25px;
-
     font-weight: bold;
 }
 
 .price {
-
     font-size: 22px;
-
     margin-top: 10px;
 }
 
-.profit-usd {
-
+.result {
     margin-top: 20px;
-
-    font-size: 18px;
-
-    color: #aeb8c8;
+    color: #aab4c4;
+    font-size: 20px;
 }
 
 .empty {
-
     text-align: center;
-
     background: #151e2e;
-
     border: 1px solid #26364f;
-
     padding: 45px 25px;
-
     border-radius: 20px;
-
     color: #aeb8c8;
-
     font-size: 20px;
-
     line-height: 1.6;
 }
 
 .diagnostics {
-
     margin-top: 25px;
-
     background: #151e2e;
-
     border: 1px solid #26364f;
-
     border-radius: 20px;
-
     padding: 20px;
 }
 
 .diagnostics h2 {
-
     margin-top: 0;
-
-    font-size: 24px;
+    font-size: 22px;
 }
 
 .diagnostic-item {
-
-    padding: 20px 0;
-
-    border-top:
-        1px solid #26364f;
+    padding: 15px;
+    border-top: 1px solid #26364f;
 }
 
 .diagnostic-item:first-of-type {
@@ -901,54 +815,33 @@ h1 {
 }
 
 .diag-name {
-
-    font-size: 21px;
-
+    font-size: 18px;
     font-weight: bold;
 }
 
 .diag-status {
-
     color: #60a5fa;
-
-    margin-top: 10px;
-
-    font-size: 17px;
+    margin-top: 5px;
 }
 
 .diag-prices {
-
     color: #6ee7b7;
-
-    margin-top: 10px;
-
-    font-size: 17px;
+    margin-top: 5px;
 }
 
 .diag-errors {
-
     color: #fca5a5;
-
-    margin-top: 10px;
-
+    margin-top: 8px;
     font-size: 14px;
-
     word-break: break-word;
 }
 
 .footer {
-
     text-align: center;
-
     color: #6b7280;
-
     margin-top: 30px;
-
-    font-size: 16px;
-
-    line-height: 1.5;
+    font-size: 14px;
 }
-
 
 @media (max-width: 600px) {
 
@@ -971,27 +864,20 @@ h1 {
     .trade-row {
         grid-template-columns: 1fr;
     }
-
-    .symbol {
-        font-size: 28px;
-    }
 }
 
 </style>
 
 </head>
 
-
 <body>
 
 <div class="container">
 
-
 <h1>🚀 Arbitrage Scanner</h1>
 
-
 <div class="subtitle">
-Мониторинг цен криптовалют между биржами
+Мониторинг реальных арбитражных возможностей между биржами
 </div>
 
 
@@ -1024,32 +910,27 @@ h1 {
 
 <div class="info-box">
 
-🎯 Текущий фильтр чистой прибыли:
+🎯 Минимальная чистая прибыль:
 {{ min_net_profit }}%
 
 <br>
 
 💸 Комиссия покупки:
-{{ buy_fee }}%
+{{ BUY_FEE if BUY_FEE else "учитывается" }}
 
 <br>
 
-💸 Торговые комиссии учитываются
+💸 Торговые комиссии учитываются с обеих сторон
 
 <br>
 
-🔄 Фоновое обновление каждые
+🔄 Новое обновление каждые
 {{ scan_interval }} секунд
 
 <br>
 
 💵 Расчёт сделки:
 ${{ trade_amount }}
-
-<br>
-
-🪙 Монет сканируется:
-{{ symbols_count }}
 
 {% if last_scan %}
 
@@ -1065,7 +946,6 @@ ${{ trade_amount }}
 
 <div class="stats">
 
-
 <div class="stat">
 
 <div class="stat-value">
@@ -1073,7 +953,7 @@ ${{ trade_amount }}
 </div>
 
 <div class="stat-label">
-Возможностей / спредов
+Прибыльных возможностей
 </div>
 
 </div>
@@ -1091,55 +971,35 @@ ${{ trade_amount }}
 
 </div>
 
-
 </div>
 
 
 {% if opportunities %}
 
-
 {% for item in opportunities %}
 
-
 <div class="card">
-
 
 <div class="symbol">
 {{ item.symbol }}
 </div>
 
 
-<div
-    class="profit-box
-    {% if item.net_profit_percent >= 0 %}
-    positive
-    {% else %}
-    negative
-    {% endif %}"
->
+<div class="profit-box">
 
-<div class="profit-main">
-
-Чистая:
-{% if item.net_profit_percent >= 0 %}+{% endif %}
-{{ item.net_profit_percent }}%
-
+<div class="net-profit">
+🟢 Чистая: +{{ item.net_profit_percent }}%
 </div>
 
-
-<div class="profit-sub">
-
+<div class="gross-profit">
 Валовый спред:
-{% if item.gross_spread_percent >= 0 %}+{% endif %}
-{{ item.gross_spread_percent }}%
-
++{{ item.gross_spread_percent }}%
 </div>
 
 </div>
 
 
 <div class="trade-row">
-
 
 <div class="buy">
 
@@ -1174,72 +1034,61 @@ ${{ item.sell_price }}
 
 </div>
 
-
 </div>
 
 
-<div class="profit-usd">
-
+<div class="result">
 💰 Результат на ${{ trade_amount }}:
-{% if item.net_profit_usd >= 0 %}+{% endif %}
-${{ item.net_profit_usd }}
-
+<strong>+${{ item.profit_usdt }}</strong>
 </div>
 
-
 </div>
-
 
 {% endfor %}
 
 
 {% else %}
 
-
 <div class="empty">
 
-🔍 Сейчас нет возможностей
-с чистой прибылью от
-{{ min_net_profit }}%.
+🔍 Сейчас нет реально прибыльных
+арбитражных возможностей.
 
 <br><br>
 
-Сканер продолжает работать в фоне.
+Все убыточные сделки автоматически
+отфильтрованы.
+
+<br><br>
+
+Сканер продолжает проверять
+8 монет на 4 биржах.
 
 </div>
-
 
 {% endif %}
 
 
 <div class="diagnostics">
 
-
 <h2>🔧 Диагностика бирж</h2>
-
 
 {% for name, diag in diagnostics.items() %}
 
-
 <div class="diagnostic-item">
-
 
 <div class="diag-name">
 {{ name.upper() }}
 </div>
 
-
 <div class="diag-status">
 Статус: {{ diag.status }}
 </div>
 
-
 <div class="diag-prices">
 Цен получено:
 {{ diag.prices_received }}
-из {{ symbols_count }}
 </div>
-
 
 {% if diag.errors %}
 
@@ -1255,18 +1104,14 @@ ${{ item.net_profit_usd }}
 
 {% endif %}
 
-
 </div>
 
-
 {% endfor %}
-
 
 </div>
 
 
 {% if error %}
-
 
 <div class="diagnostics">
 
@@ -1278,7 +1123,6 @@ ${{ item.net_profit_usd }}
 
 </div>
 
-
 {% endif %}
 
 
@@ -1288,7 +1132,6 @@ ${{ item.net_profit_usd }}
 {{ scan_interval }} секунд
 
 </div>
-
 
 </div>
 
@@ -1304,10 +1147,10 @@ setTimeout(
 
 </script>
 
-
 </body>
 </html>
         """,
+        BUY_FEE=BUY_FEE * 100,
         **data
     )
 
@@ -1326,20 +1169,8 @@ def scan():
             "status":
                 scanner_state["status"],
 
-            "symbols":
-                SYMBOLS,
-
-            "symbols_count":
-                len(SYMBOLS),
-
             "min_net_profit":
                 MIN_NET_PROFIT,
-
-            "buy_fee_percent":
-                BUY_FEE * 100,
-
-            "sell_fee_percent":
-                SELL_FEE * 100,
 
             "trade_amount":
                 TRADE_AMOUNT,
@@ -1389,7 +1220,6 @@ if __name__ == "__main__":
 
     import os
 
-
     port = int(
         os.environ.get(
             "PORT",
@@ -1397,8 +1227,8 @@ if __name__ == "__main__":
         )
     )
 
-
     app.run(
         host="0.0.0.0",
-        port=port
+        port=port,
+        debug=False
     )
