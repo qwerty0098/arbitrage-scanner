@@ -1,164 +1,139 @@
 from flask import Flask, jsonify, render_template_string
 import ccxt
-import os
-import time
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 app = Flask(__name__)
 
-# ==========================================
+# =========================
 # НАСТРОЙКИ
-# ==========================================
+# =========================
 
-exchange_names = [
+EXCHANGE_NAMES = [
     "kraken",
     "kucoin",
     "bitget",
     "bybit",
 ]
 
-symbols = [
+SYMBOLS = [
     "BTC/USDT",
     "ETH/USDT",
     "SOL/USDT",
     "XRP/USDT",
 ]
 
-TRADE_AMOUNT_USD = 1000
-
-MIN_NET_PROFIT_PERCENT = 0.1
-
+# Обновление цен каждые 15 секунд
 SCAN_INTERVAL = 15
 
-EXCHANGE_FEES = {
-    "kraken": 0.0026,
-    "kucoin": 0.0010,
-    "bitget": 0.0010,
-    "bybit": 0.0010,
-}
+# Таймаут одного запроса к бирже
+REQUEST_TIMEOUT = 5000
+
+# Примерная комиссия 0.1% за покупку
+BUY_FEE = 0.001
+
+# Примерная комиссия 0.1% за продажу
+SELL_FEE = 0.001
+
+# Минимальная чистая прибыль после комиссий
+MIN_NET_PROFIT = 0.1
 
 
-# ==========================================
-# КЭШ РЕЗУЛЬТАТОВ
-# ==========================================
+# =========================
+# ОБЩЕЕ СОСТОЯНИЕ СКАНЕРА
+# =========================
 
-cache_lock = threading.Lock()
-
-scan_cache = {
+scanner_state = {
+    "status": "starting",
     "opportunities": [],
     "prices": [],
+    "opportunities_found": 0,
+    "prices_received": 0,
     "last_scan": None,
-    "scan_time": 0,
-    "status": "starting",
     "error": None,
 }
 
+state_lock = threading.Lock()
+scan_lock = threading.Lock()
 
-# ==========================================
-# ПОДКЛЮЧЕНИЕ К БИРЖЕ
-# ==========================================
+
+# =========================
+# СОЗДАНИЕ БИРЖИ
+# =========================
 
 def get_exchange(name):
-
     exchange_class = getattr(ccxt, name)
 
     return exchange_class({
         "enableRateLimit": True,
-        "timeout": 5000,
+        "timeout": REQUEST_TIMEOUT,
     })
 
 
-# ==========================================
-# ПОЛУЧЕНИЕ ОДНОЙ ЦЕНЫ
-# ==========================================
+# =========================
+# СКАНИРОВАНИЕ ОДНОЙ БИРЖИ
+# =========================
 
-def fetch_one_price(exchange_name, symbol):
+def scan_exchange(exchange_name):
+    results = []
 
     try:
-
         exchange = get_exchange(exchange_name)
 
-        ticker = exchange.fetch_ticker(symbol)
-
-        bid = ticker.get("bid")
-        ask = ticker.get("ask")
-
-        if bid and ask and bid > 0 and ask > 0:
-
-            return {
-                "exchange": exchange_name,
-                "symbol": symbol,
-                "bid": float(bid),
-                "ask": float(ask),
-            }
-
-    except Exception as e:
-        print(
-            f"Ошибка {exchange_name} {symbol}: {str(e)[:100]}"
-        )
-
-    return None
-
-
-# ==========================================
-# СКАНИРОВАНИЕ
-# ==========================================
-
-def scan_market():
-
-    start_time = time.time()
-
-    all_prices = []
-
-    tasks = []
-
-    # Создаём все задачи
-    for exchange_name in exchange_names:
-        for symbol in symbols:
-            tasks.append(
-                (exchange_name, symbol)
-            )
-
-    # Выполняем запросы параллельно
-    with ThreadPoolExecutor(
-        max_workers=8
-    ) as executor:
-
-        futures = {
-            executor.submit(
-                fetch_one_price,
-                exchange_name,
-                symbol
-            ): (
-                exchange_name,
-                symbol
-            )
-
-            for exchange_name, symbol in tasks
-        }
-
-        for future in as_completed(futures):
-
+        for symbol in SYMBOLS:
             try:
+                ticker = exchange.fetch_ticker(symbol)
 
-                result = future.result(
-                    timeout=7
-                )
+                bid = ticker.get("bid")
+                ask = ticker.get("ask")
 
-                if result:
-                    all_prices.append(result)
+                if bid is not None and ask is not None:
+                    if bid > 0 and ask > 0:
+                        results.append({
+                            "exchange": exchange_name,
+                            "symbol": symbol,
+                            "bid": float(bid),
+                            "ask": float(ask),
+                        })
 
             except Exception:
                 continue
 
-    results = []
+    except Exception:
+        pass
 
-    # ==========================================
-    # ИЩЕМ АРБИТРАЖ
-    # ==========================================
+    return results
 
-    for symbol in symbols:
+
+# =========================
+# ОДИН ПОЛНЫЙ СКАН
+# =========================
+
+def get_opportunities():
+    all_prices = []
+
+    # Одновременно работаем с 4 биржами.
+    # Это быстрее, чем ждать каждую по очереди.
+    with ThreadPoolExecutor(max_workers=4) as executor:
+
+        futures = {
+            executor.submit(scan_exchange, exchange_name): exchange_name
+            for exchange_name in EXCHANGE_NAMES
+        }
+
+        for future in as_completed(futures):
+            try:
+                prices = future.result()
+                all_prices.extend(prices)
+
+            except Exception:
+                continue
+
+    opportunities = []
+
+    # Ищем лучшую покупку и лучшую продажу
+    for symbol in SYMBOLS:
 
         prices = [
             item
@@ -179,283 +154,161 @@ def scan_market():
             key=lambda x: x["bid"]
         )
 
-        # Не покупаем и не продаём на одной бирже
-        if (
-            buy_exchange["exchange"]
-            == sell_exchange["exchange"]
-        ):
+        # Не имеет смысла покупать и продавать на одной бирже
+        if buy_exchange["exchange"] == sell_exchange["exchange"]:
             continue
 
         buy_price = buy_exchange["ask"]
-
         sell_price = sell_exchange["bid"]
 
-        # Валовый спред
-        gross_spread_percent = (
-            (
-                sell_price - buy_price
-            )
+        # Валовая разница
+        gross_spread = (
+            (sell_price - buy_price)
             / buy_price
         ) * 100
 
-        buy_fee = EXCHANGE_FEES.get(
-            buy_exchange["exchange"],
-            0.001
-        )
+        # Стоимость покупки с комиссией
+        buy_cost = buy_price * (1 + BUY_FEE)
 
-        sell_fee = EXCHANGE_FEES.get(
-            sell_exchange["exchange"],
-            0.001
-        )
+        # Сумма после продажи с комиссией
+        sell_revenue = sell_price * (1 - SELL_FEE)
 
-        # Более точный расчёт чистой прибыли
-        quantity = (
-            TRADE_AMOUNT_USD
-            / buy_price
-        )
-
-        buy_fee_usd = (
-            TRADE_AMOUNT_USD
-            * buy_fee
-        )
-
-        gross_sell_value = (
-            quantity
-            * sell_price
-        )
-
-        sell_fee_usd = (
-            gross_sell_value
-            * sell_fee
-        )
-
-        net_profit_usd = (
-            gross_sell_value
-            - TRADE_AMOUNT_USD
-            - buy_fee_usd
-            - sell_fee_usd
-        )
-
+        # Чистая прибыль
         net_profit_percent = (
-            net_profit_usd
-            / TRADE_AMOUNT_USD
+            (sell_revenue - buy_cost)
+            / buy_cost
         ) * 100
 
-        if (
-            net_profit_percent
-            < MIN_NET_PROFIT_PERCENT
-        ):
-            continue
+        # Показываем только реально положительные варианты
+        if net_profit_percent >= MIN_NET_PROFIT:
 
-        results.append({
+            opportunities.append({
+                "symbol": symbol,
 
-            "symbol": symbol,
+                "buy_exchange":
+                    buy_exchange["exchange"].upper(),
 
-            "buy_exchange":
-                buy_exchange["exchange"].upper(),
+                "buy_price":
+                    round(buy_price, 4),
 
-            "buy_price":
-                round(buy_price, 6),
+                "sell_exchange":
+                    sell_exchange["exchange"].upper(),
 
-            "sell_exchange":
-                sell_exchange["exchange"].upper(),
+                "sell_price":
+                    round(sell_price, 4),
 
-            "sell_price":
-                round(sell_price, 6),
+                "gross_spread_percent":
+                    round(gross_spread, 3),
 
-            "gross_spread_percent":
-                round(
-                    gross_spread_percent,
-                    3
-                ),
+                "net_profit_percent":
+                    round(net_profit_percent, 3),
+            })
 
-            "net_profit_percent":
-                round(
-                    net_profit_percent,
-                    3
-                ),
-
-            "net_profit_usd":
-                round(
-                    net_profit_usd,
-                    2
-                ),
-
-            "trade_amount":
-                TRADE_AMOUNT_USD,
-
-            "buy_fee_percent":
-                round(
-                    buy_fee * 100,
-                    3
-                ),
-
-            "sell_fee_percent":
-                round(
-                    sell_fee * 100,
-                    3
-                ),
-        })
-
-    # Самые прибыльные сверху
-    results.sort(
-        key=lambda x: x[
-            "net_profit_percent"
-        ],
+    opportunities.sort(
+        key=lambda x: x["net_profit_percent"],
         reverse=True
     )
 
-    scan_time = round(
-        time.time() - start_time,
-        2
-    )
-
-    return (
-        results,
-        all_prices,
-        scan_time
-    )
+    return opportunities, all_prices
 
 
-# ==========================================
-# ФОНОВЫЙ СКАНЕР
-# ==========================================
+# =========================
+# ФОНОВОЙ СКАН
+# =========================
 
-def background_scanner():
+def run_scan():
+    # Не запускаем два скана одновременно
+    if not scan_lock.acquire(blocking=False):
+        return
 
-    print("Фоновый сканер запущен")
+    try:
+        with state_lock:
+            scanner_state["status"] = "scanning"
+            scanner_state["error"] = None
+
+        opportunities, prices = get_opportunities()
+
+        with state_lock:
+            scanner_state["opportunities"] = opportunities
+            scanner_state["prices"] = prices
+            scanner_state["opportunities_found"] = len(opportunities)
+            scanner_state["prices_received"] = len(prices)
+            scanner_state["last_scan"] = time.strftime(
+                "%d.%m.%Y %H:%M:%S"
+            )
+            scanner_state["status"] = "active"
+            scanner_state["error"] = None
+
+    except Exception as error:
+
+        with state_lock:
+            scanner_state["status"] = "error"
+            scanner_state["error"] = str(error)
+
+    finally:
+        scan_lock.release()
+
+
+# =========================
+# ПОСТОЯННЫЙ ФОНОВЫЙ СКАНЕР
+# =========================
+
+def scanner_loop():
+
+    # Первый скан запускаем сразу после старта
+    run_scan()
 
     while True:
-
-        try:
-
-            with cache_lock:
-
-                scan_cache["status"] = (
-                    "scanning"
-                )
-
-            opportunities, prices, scan_time = (
-                scan_market()
-            )
-
-            with cache_lock:
-
-                scan_cache[
-                    "opportunities"
-                ] = opportunities
-
-                scan_cache[
-                    "prices"
-                ] = prices
-
-                scan_cache[
-                    "last_scan"
-                ] = time.strftime(
-                    "%H:%M:%S"
-                )
-
-                scan_cache[
-                    "scan_time"
-                ] = scan_time
-
-                scan_cache[
-                    "status"
-                ] = "active"
-
-                scan_cache[
-                    "error"
-                ] = None
-
-            print(
-                f"Сканирование завершено: "
-                f"{len(opportunities)} возможностей, "
-                f"{len(prices)} цен, "
-                f"{scan_time} сек"
-            )
-
-        except Exception as e:
-
-            print(
-                f"Ошибка сканера: {str(e)}"
-            )
-
-            with cache_lock:
-
-                scan_cache[
-                    "status"
-                ] = "error"
-
-                scan_cache[
-                    "error"
-                ] = str(e)
-
-        # Ждём перед следующим сканированием
-        time.sleep(
-            SCAN_INTERVAL
-        )
+        time.sleep(SCAN_INTERVAL)
+        run_scan()
 
 
-# ==========================================
-# ЗАПУСК ФОНОВОГО СКАНЕРА
-# ==========================================
+# =========================
+# ЗАПУСК ФОНОВОГО ПОТОКА
+# =========================
 
 scanner_thread = threading.Thread(
-    target=background_scanner,
+    target=scanner_loop,
     daemon=True
 )
 
 scanner_thread.start()
 
 
-# ==========================================
+# =========================
 # ГЛАВНАЯ СТРАНИЦА
-# ==========================================
+# =========================
 
 @app.route("/")
 def home():
 
-    with cache_lock:
-
-        opportunities = (
-            scan_cache[
-                "opportunities"
-            ].copy()
-        )
-
-        prices = (
-            scan_cache[
-                "prices"
-            ].copy()
-        )
-
-        status = (
-            scan_cache["status"]
-        )
-
-        last_scan = (
-            scan_cache["last_scan"]
-        )
-
-        scan_time = (
-            scan_cache["scan_time"]
-        )
+    with state_lock:
+        data = {
+            "status": scanner_state["status"],
+            "opportunities": list(
+                scanner_state["opportunities"]
+            ),
+            "opportunities_found":
+                scanner_state["opportunities_found"],
+            "prices_received":
+                scanner_state["prices_received"],
+            "last_scan":
+                scanner_state["last_scan"],
+            "error":
+                scanner_state["error"],
+        }
 
     return render_template_string("""
-
 <!DOCTYPE html>
 <html lang="ru">
 
 <head>
-
 <meta charset="UTF-8">
 
 <meta
-name="viewport"
-content="width=device-width, initial-scale=1.0"
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
 >
-
-<meta http-equiv="refresh" content="15">
 
 <title>Arbitrage Scanner</title>
 
@@ -468,9 +321,13 @@ content="width=device-width, initial-scale=1.0"
 body {
     margin: 0;
     padding: 20px;
-    font-family: Arial, sans-serif;
+
+    font-family:
+        Arial,
+        sans-serif;
+
     background: #0b0f19;
-    color: #ffffff;
+    color: #f8fafc;
 }
 
 .container {
@@ -479,184 +336,227 @@ body {
 }
 
 h1 {
-    font-size: 34px;
-    margin-bottom: 8px;
+    font-size: 38px;
+    margin-bottom: 10px;
 }
 
 .subtitle {
-    color: #9ca3af;
-    font-size: 18px;
+    color: #aab4c4;
+    font-size: 20px;
     margin-bottom: 25px;
 }
 
 .status {
     display: inline-block;
-    background: #064e3b;
-    color: #6ee7b7;
-    padding: 12px 18px;
-    border-radius: 20px;
+
+    padding: 12px 20px;
+
+    border-radius: 30px;
+
+    font-size: 18px;
+
     margin-bottom: 25px;
-    font-size: 17px;
 }
 
-.status-starting {
+.status.active {
+    background: #064e3b;
+    color: #6ee7b7;
+}
+
+.status.scanning,
+.status.starting {
     background: #78350f;
     color: #fbbf24;
 }
 
+.status.error {
+    background: #7f1d1d;
+    color: #fca5a5;
+}
+
 .info-box {
-    background: #111827;
-    border: 1px solid #1f2937;
-    border-radius: 16px;
-    padding: 20px;
+    background: #151e2e;
+
+    border: 1px solid #26364f;
+
+    border-radius: 20px;
+
+    padding: 22px;
+
     margin-bottom: 25px;
-    color: #9ca3af;
+
+    color: #aeb8c8;
+
+    font-size: 18px;
+
     line-height: 1.8;
 }
 
 .stats {
     display: flex;
-    gap: 15px;
+
+    gap: 20px;
+
     margin-bottom: 25px;
 }
 
 .stat {
     flex: 1;
-    background: #111827;
-    padding: 20px;
-    border-radius: 16px;
-    border: 1px solid #1f2937;
+
+    background: #151e2e;
+
+    border: 1px solid #26364f;
+
+    border-radius: 20px;
+
+    padding: 25px;
 }
 
 .stat-value {
-    font-size: 32px;
+    font-size: 44px;
+
     font-weight: bold;
+
     color: #60a5fa;
 }
 
 .stat-label {
-    color: #9ca3af;
-    margin-top: 8px;
+    color: #aeb8c8;
+
+    font-size: 18px;
+
+    margin-top: 10px;
 }
 
 .card {
-    background: #111827;
-    border: 1px solid #1f2937;
-    border-radius: 16px;
-    padding: 20px;
-    margin-bottom: 18px;
+    background: #151e2e;
+
+    border: 1px solid #26364f;
+
+    border-radius: 20px;
+
+    padding: 25px;
+
+    margin-bottom: 20px;
 }
 
 .card-header {
     display: flex;
+
     justify-content: space-between;
+
+    align-items: center;
+
     gap: 15px;
+
     margin-bottom: 20px;
 }
 
 .symbol {
-    font-size: 25px;
+    font-size: 30px;
+
     font-weight: bold;
 }
 
 .spread {
     background: #065f46;
+
     color: #6ee7b7;
-    padding: 9px 15px;
-    border-radius: 20px;
+
+    padding: 10px 18px;
+
+    border-radius: 30px;
+
+    font-size: 20px;
+
     font-weight: bold;
+
     white-space: nowrap;
 }
 
 .trade-row {
     display: grid;
+
     grid-template-columns: 1fr 1fr;
-    gap: 15px;
+
+    gap: 18px;
 }
 
 .buy,
 .sell {
-    padding: 18px;
-    border-radius: 12px;
+    padding: 20px;
+
+    border-radius: 16px;
 }
 
 .buy {
-    background: #172554;
+    background: #23315b;
 }
 
 .sell {
-    background: #3f1d2e;
+    background: #4a2435;
 }
 
 .label {
-    color: #9ca3af;
-    font-size: 14px;
+    color: #b7c0d0;
+
+    font-size: 16px;
+
     margin-bottom: 10px;
 }
 
 .exchange {
-    font-size: 22px;
+    font-size: 25px;
+
     font-weight: bold;
 }
 
 .price {
-    font-size: 20px;
-    margin-top: 8px;
-}
+    font-size: 22px;
 
-.profit-box {
-    margin-top: 18px;
-    background: #064e3b;
-    border-radius: 12px;
-    padding: 16px;
-}
-
-.profit-title {
-    color: #9ca3af;
-}
-
-.profit-value {
-    font-size: 28px;
-    color: #6ee7b7;
-    font-weight: bold;
-    margin-top: 5px;
-}
-
-.details {
     margin-top: 10px;
-    color: #9ca3af;
-    font-size: 13px;
 }
 
 .empty {
     text-align: center;
-    background: #111827;
+
+    background: #151e2e;
+
+    border: 1px solid #26364f;
+
     padding: 45px 25px;
-    border-radius: 16px;
-    color: #9ca3af;
-    border: 1px solid #1f2937;
-    font-size: 18px;
-    line-height: 1.7;
+
+    border-radius: 20px;
+
+    color: #aeb8c8;
+
+    font-size: 20px;
+
+    line-height: 1.6;
 }
 
 .footer {
     text-align: center;
-    color: #6b7280;
-    margin-top: 30px;
-}
 
-.footer a {
-    color: #60a5fa;
+    color: #6b7280;
+
+    margin-top: 30px;
+
+    font-size: 14px;
 }
 
 @media (max-width: 600px) {
 
     body {
-        padding: 15px;
+        padding: 16px;
     }
 
     h1 {
-        font-size: 28px;
+        font-size: 32px;
+    }
+
+    .subtitle {
+        font-size: 18px;
     }
 
     .stats {
@@ -668,14 +568,15 @@ h1 {
     }
 
     .card-header {
+        align-items: flex-start;
         flex-direction: column;
     }
-
 }
 
 </style>
 
 </head>
+
 
 <body>
 
@@ -690,14 +591,26 @@ h1 {
 
 {% if status == "active" %}
 
-<div class="status">
+<div class="status active">
 ● Сканер активен
+</div>
+
+{% elif status == "scanning" %}
+
+<div class="status scanning">
+● Сканирование...
+</div>
+
+{% elif status == "starting" %}
+
+<div class="status starting">
+● Сканер запускается...
 </div>
 
 {% else %}
 
-<div class="status status-starting">
-● Сканер запускается...
+<div class="status error">
+● Ошибка сканирования
 </div>
 
 {% endif %}
@@ -706,7 +619,7 @@ h1 {
 <div class="info-box">
 
 🎯 Минимальная чистая прибыль:
-{{ min_profit }}%
+0.1%
 
 <br>
 
@@ -720,7 +633,16 @@ h1 {
 <br>
 
 💵 Расчёт сделки:
-${{ trade_amount }}
+$1000
+
+{% if last_scan %}
+
+<br>
+
+🕒 Последний скан:
+{{ last_scan }}
+
+{% endif %}
 
 </div>
 
@@ -730,7 +652,7 @@ ${{ trade_amount }}
 <div class="stat">
 
 <div class="stat-value">
-{{ opportunities|length }}
+{{ opportunities_found }}
 </div>
 
 <div class="stat-label">
@@ -743,24 +665,11 @@ ${{ trade_amount }}
 <div class="stat">
 
 <div class="stat-value">
-{{ prices|length }}
+{{ prices_received }}
 </div>
 
 <div class="stat-label">
 Цен получено
-</div>
-
-</div>
-
-
-<div class="stat">
-
-<div class="stat-value">
-{{ scan_time }}
-</div>
-
-<div class="stat-label">
-Секунд на сканирование
 </div>
 
 </div>
@@ -824,31 +733,6 @@ ${{ item.sell_price }}
 
 </div>
 
-
-<div class="profit-box">
-
-<div class="profit-title">
-💵 Примерная чистая прибыль
-с ${{ item.trade_amount }}
-</div>
-
-<div class="profit-value">
-+${{ item.net_profit_usd }}
-</div>
-
-<div class="details">
-
-Валовый спред:
-{{ item.gross_spread_percent }}%
-
-•
-
-Комиссии уже учтены
-
-</div>
-
-</div>
-
 </div>
 
 {% endfor %}
@@ -858,21 +742,12 @@ ${{ item.sell_price }}
 
 <div class="empty">
 
-🔍 Пока подходящих возможностей нет.
+🔍 Сейчас нет возможностей
+с чистой прибылью от 0.1%.
 
 <br><br>
 
-{% if status != "active" %}
-
-Сканер получает первые данные с бирж.
-
-{% else %}
-
-Все найденные варианты после комиссий
-дают чистую прибыль менее
-{{ min_profit }}%.
-
-{% endif %}
+Сканер продолжает работать в фоне.
 
 </div>
 
@@ -881,75 +756,83 @@ ${{ item.sell_price }}
 
 <div class="footer">
 
-Последнее сканирование:
-{{ last_scan or "ожидание..." }}
-
-•
-
-<a href="/scan">
-JSON API
-</a>
+Страница обновляется автоматически •
+Следующее сканирование через 15 секунд
 
 </div>
 
 </div>
+
+
+<script>
+
+// Просто обновляем страницу.
+// Само сканирование НЕ происходит
+// во время загрузки страницы.
+
+setTimeout(function () {
+    window.location.reload();
+}, 15000);
+
+</script>
 
 </body>
 </html>
-
-    """,
-
-    opportunities=opportunities,
-    prices=prices,
-    status=status,
-    last_scan=last_scan,
-    scan_time=scan_time,
-    min_profit=MIN_NET_PROFIT_PERCENT,
-    trade_amount=TRADE_AMOUNT_USD
-    )
+    """, **data)
 
 
-# ==========================================
+# =========================
 # JSON API
-# ==========================================
+# =========================
 
 @app.route("/scan")
 def scan():
 
-    with cache_lock:
+    with state_lock:
 
         return jsonify({
-            "status": scan_cache["status"],
-            "last_scan": scan_cache["last_scan"],
-            "scan_time": scan_cache["scan_time"],
-            "trade_amount_usd":
-                TRADE_AMOUNT_USD,
-            "min_net_profit_percent":
-                MIN_NET_PROFIT_PERCENT,
+            "status":
+                scanner_state["status"],
+
             "opportunities_found":
-                len(
-                    scan_cache[
-                        "opportunities"
-                    ]
-                ),
+                scanner_state[
+                    "opportunities_found"
+                ],
+
             "opportunities":
-                scan_cache[
+                scanner_state[
                     "opportunities"
                 ],
-            "prices_checked":
-                len(
-                    scan_cache[
-                        "prices"
-                    ]
-                ),
+
+            "prices_received":
+                scanner_state[
+                    "prices_received"
+                ],
+
+            "prices":
+                scanner_state[
+                    "prices"
+                ],
+
+            "last_scan":
+                scanner_state[
+                    "last_scan"
+                ],
+
+            "error":
+                scanner_state[
+                    "error"
+                ],
         })
 
 
-# ==========================================
+# =========================
 # ЗАПУСК
-# ==========================================
+# =========================
 
 if __name__ == "__main__":
+
+    import os
 
     port = int(
         os.environ.get(
