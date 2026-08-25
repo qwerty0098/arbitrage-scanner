@@ -1,4 +1,4 @@
-rom flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string
 import ccxt
 import threading
 import time
