@@ -1,3 +1,4 @@
 flask
 ccxt
+requests
 gunicorn
