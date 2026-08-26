@@ -3,6 +3,7 @@ import time
 import uuid
 import threading
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ccxt
 import requests
@@ -26,11 +27,11 @@ TELEGRAM_CHAT_ID = str(
 ).strip()
 
 
-# Размер одной сделки
+# Размер одной сделки в USDT / USD
 TRADE_AMOUNT_USD = 1000
 
 # Минимальная чистая прибыль
-MIN_NET_PROFIT_PERCENT = 0.01
+MIN_NET_PROFIT_PERCENT = 0.30
 
 # Интервал полного сканирования
 SCAN_INTERVAL = 15
@@ -43,6 +44,20 @@ NOTIFICATION_COOLDOWN = 300
 
 # Сколько возможностей максимум отправлять за один скан
 MAX_NOTIFICATIONS_PER_SCAN = 3
+
+# Возможность в Telegram действует 5 минут
+OPPORTUNITY_TTL = 300
+
+# Глубина стакана для проверки
+ORDER_BOOK_LIMIT = 20
+
+# Запас ликвидности.
+# Для сделки на $1000 желательно иметь минимум
+# $1200 ликвидности в стакане.
+LIQUIDITY_SAFETY_MULTIPLIER = 1.20
+
+# Количество потоков для параллельных запросов
+MAX_WORKERS = 9
 
 
 # ============================================================
@@ -129,17 +144,21 @@ app = Flask(__name__)
 exchanges = {}
 
 for exchange_id, exchange_class in EXCHANGE_CLASSES.items():
+
     try:
+
         exchanges[exchange_id] = exchange_class({
             "enableRateLimit": True,
             "timeout": 15000,
         })
 
         print(
-            f"✅ Подключена биржа: {exchange_id}"
+            f"✅ Подключена биржа: "
+            f"{exchange_id}"
         )
 
     except Exception as e:
+
         print(
             f"❌ Ошибка подключения "
             f"{exchange_id}: {e}"
@@ -160,7 +179,6 @@ scanner_started = False
 telegram_started = False
 services_started = False
 
-# Текущая информация о сканировании
 current_symbol = None
 current_symbol_index = 0
 current_scan_total = len(SYMBOLS)
@@ -181,14 +199,13 @@ def telegram_api(
     data=None,
     request_method="POST"
 ):
-    """
-    Запрос к Telegram Bot API.
-    """
 
     if not TELEGRAM_BOT_TOKEN:
+
         print(
             "❌ TELEGRAM_BOT_TOKEN отсутствует"
         )
+
         return None
 
     url = (
@@ -243,9 +260,6 @@ def send_telegram_message(
     text,
     reply_markup=None
 ):
-    """
-    Отправляет сообщение пользователю.
-    """
 
     if not TELEGRAM_BOT_TOKEN:
 
@@ -272,6 +286,7 @@ def send_telegram_message(
     }
 
     if reply_markup:
+
         data["reply_markup"] = reply_markup
 
     return telegram_api(
@@ -285,9 +300,6 @@ def answer_callback_query(
     callback_query_id,
     text=""
 ):
-    """
-    Убирает загрузку после нажатия кнопки.
-    """
 
     return telegram_api(
         "answerCallbackQuery",
@@ -321,8 +333,7 @@ def check_telegram_connection():
     if not TELEGRAM_BOT_TOKEN:
 
         print(
-            "❌ TELEGRAM_BOT_TOKEN не найден "
-            "в Variables Railway"
+            "❌ TELEGRAM_BOT_TOKEN не найден"
         )
 
         return False
@@ -330,8 +341,7 @@ def check_telegram_connection():
     if not TELEGRAM_CHAT_ID:
 
         print(
-            "❌ TELEGRAM_CHAT_ID не найден "
-            "в Variables Railway"
+            "❌ TELEGRAM_CHAT_ID не найден"
         )
 
         return False
@@ -396,11 +406,14 @@ def check_telegram_connection():
 🏦 Бирж подключено:
 <b>{len(exchanges)}</b>
 
-🔍 Каждая монета сравнивается
-между всеми доступными биржами.
+⚡ Цены и стаканы получаются
+параллельно со всех бирж.
 
-🚀 Система готова к поиску
-арбитражных возможностей.
+📚 Включена проверка:
+<b>стакана и ликвидности</b>
+
+🔁 После нажатия кнопки
+выполняется повторная проверка.
 """
 
     send_result = send_telegram_message(
@@ -434,10 +447,10 @@ def check_telegram_connection():
 
 
 # ============================================================
-# ПОЛУЧЕНИЕ ЦЕНЫ
+# ПОЛУЧЕНИЕ СТАКАНА
 # ============================================================
 
-def get_price(
+def get_order_book(
     exchange_id,
     symbol
 ):
@@ -447,35 +460,76 @@ def get_price(
     )
 
     if not exchange:
+
         return None
 
     try:
 
-        ticker = exchange.fetch_ticker(
-            symbol
+        order_book = exchange.fetch_order_book(
+            symbol,
+            limit=ORDER_BOOK_LIMIT,
         )
 
-        ask = ticker.get("ask")
-        bid = ticker.get("bid")
+        asks = order_book.get(
+            "asks",
+            []
+        )
 
-        if not ask or not bid:
+        bids = order_book.get(
+            "bids",
+            []
+        )
+
+        if not asks or not bids:
+
             return None
 
-        ask = float(ask)
-        bid = float(bid)
+        clean_asks = []
+        clean_bids = []
 
-        if ask <= 0 or bid <= 0:
+        for level in asks:
+
+            if len(level) < 2:
+                continue
+
+            price = float(level[0])
+            amount = float(level[1])
+
+            if price > 0 and amount > 0:
+
+                clean_asks.append(
+                    [price, amount]
+                )
+
+        for level in bids:
+
+            if len(level) < 2:
+                continue
+
+            price = float(level[0])
+            amount = float(level[1])
+
+            if price > 0 and amount > 0:
+
+                clean_bids.append(
+                    [price, amount]
+                )
+
+        if not clean_asks or not clean_bids:
+
             return None
 
         return {
-            "ask": ask,
-            "bid": bid,
+            "asks": clean_asks,
+            "bids": clean_bids,
+            "best_ask": clean_asks[0][0],
+            "best_bid": clean_bids[0][0],
         }
 
     except Exception as e:
 
         print(
-            f"⚠️ Ошибка цены "
+            f"⚠️ Ошибка стакана "
             f"{exchange_id} "
             f"{symbol}: {e}"
         )
@@ -484,56 +538,367 @@ def get_price(
 
 
 # ============================================================
-# РАСЧЁТ АРБИТРАЖА
+# ПАРАЛЛЕЛЬНОЕ ПОЛУЧЕНИЕ СТАКАНОВ
 # ============================================================
 
-def calculate_opportunity(
-    symbol,
-    buy_exchange,
-    buy_price,
-    sell_exchange,
-    sell_price,
+def get_all_order_books_parallel(
+    symbol
 ):
 
-    buy_fee_percent = EXCHANGE_FEES.get(
-        buy_exchange,
-        0.10
+    results = {}
+
+    exchange_ids = list(
+        exchanges.keys()
     )
 
-    sell_fee_percent = EXCHANGE_FEES.get(
-        sell_exchange,
-        0.10
+    if not exchange_ids:
+
+        return results
+
+    workers = min(
+        MAX_WORKERS,
+        len(exchange_ids)
     )
 
-    # Стоимость покупки с комиссией
-    buy_cost = (
-        TRADE_AMOUNT_USD
-        * (
-            1 + buy_fee_percent / 100
+    with ThreadPoolExecutor(
+        max_workers=workers
+    ) as executor:
+
+        future_to_exchange = {
+
+            executor.submit(
+                get_order_book,
+                exchange_id,
+                symbol,
+            ): exchange_id
+
+            for exchange_id
+            in exchange_ids
+        }
+
+        for future in as_completed(
+            future_to_exchange
+        ):
+
+            exchange_id = (
+                future_to_exchange[
+                    future
+                ]
+            )
+
+            try:
+
+                order_book = future.result()
+
+                if order_book:
+
+                    results[
+                        exchange_id
+                    ] = order_book
+
+            except Exception as e:
+
+                print(
+                    f"⚠️ Параллельная ошибка "
+                    f"{exchange_id} "
+                    f"{symbol}: {e}"
+                )
+
+    return results
+
+
+# ============================================================
+# РАСЧЁТ ПОКУПКИ ПО СТАКАНУ
+# ============================================================
+
+def simulate_buy(
+    asks,
+    quote_amount
+):
+
+    if not asks:
+
+        return None
+
+    remaining_usd = float(
+        quote_amount
+    )
+
+    total_spent = 0.0
+    total_quantity = 0.0
+
+    for level in asks:
+
+        price = float(level[0])
+        available_quantity = float(
+            level[1]
         )
+
+        if price <= 0:
+            continue
+
+        level_value = (
+            price
+            * available_quantity
+        )
+
+        if remaining_usd <= 0:
+            break
+
+        spend = min(
+            remaining_usd,
+            level_value,
+        )
+
+        quantity = (
+            spend
+            / price
+        )
+
+        total_spent += spend
+        total_quantity += quantity
+
+        remaining_usd -= spend
+
+    if remaining_usd > 0.000001:
+
+        return None
+
+    if total_quantity <= 0:
+
+        return None
+
+    average_price = (
+        total_spent
+        / total_quantity
     )
 
-    # Количество покупаемой монеты
-    quantity = (
-        TRADE_AMOUNT_USD
-        / buy_price
-    )
+    return {
+        "spent": total_spent,
+        "quantity": total_quantity,
+        "average_price": average_price,
+    }
 
-    # Валовая выручка
-    gross_revenue = (
+
+# ============================================================
+# РАСЧЁТ ПРОДАЖИ ПО СТАКАНУ
+# ============================================================
+
+def simulate_sell(
+    bids,
+    quantity
+):
+
+    if not bids:
+
+        return None
+
+    remaining_quantity = float(
         quantity
-        * sell_price
     )
 
-    # Выручка после комиссии продажи
-    sell_revenue = (
-        gross_revenue
-        * (
-            1 - sell_fee_percent / 100
+    total_revenue = 0.0
+    total_sold = 0.0
+
+    for level in bids:
+
+        price = float(level[0])
+        available_quantity = float(
+            level[1]
+        )
+
+        if price <= 0:
+            continue
+
+        if remaining_quantity <= 0:
+            break
+
+        sell_quantity = min(
+            remaining_quantity,
+            available_quantity,
+        )
+
+        total_revenue += (
+            sell_quantity
+            * price
+        )
+
+        total_sold += sell_quantity
+
+        remaining_quantity -= (
+            sell_quantity
+        )
+
+    if remaining_quantity > 0.00000001:
+
+        return None
+
+    if total_sold <= 0:
+
+        return None
+
+    average_price = (
+        total_revenue
+        / total_sold
+    )
+
+    return {
+        "revenue": total_revenue,
+        "quantity": total_sold,
+        "average_price": average_price,
+    }
+
+
+# ============================================================
+# ПРОВЕРКА ЛИКВИДНОСТИ ПО СТАКАНУ
+# ============================================================
+
+def calculate_buy_liquidity(
+    asks
+):
+
+    return sum(
+        float(price)
+        * float(amount)
+
+        for price, amount
+        in asks
+    )
+
+
+def calculate_sell_liquidity(
+    bids,
+    reference_price
+):
+
+    if reference_price <= 0:
+
+        return 0.0
+
+    return sum(
+        float(price)
+        * float(amount)
+
+        for price, amount
+        in bids
+    )
+
+
+# ============================================================
+# РАСЧЁТ АРБИТРАЖА ПО РЕАЛЬНЫМ СТАКАНАМ
+# ============================================================
+
+def calculate_order_book_opportunity(
+    symbol,
+    buy_exchange,
+    buy_order_book,
+    sell_exchange,
+    sell_order_book,
+):
+
+    # --------------------------------------------------------
+    # Сначала проверяем общую ликвидность
+    # --------------------------------------------------------
+
+    required_liquidity = (
+        TRADE_AMOUNT_USD
+        * LIQUIDITY_SAFETY_MULTIPLIER
+    )
+
+    buy_liquidity = (
+        calculate_buy_liquidity(
+            buy_order_book["asks"]
         )
     )
 
+    sell_liquidity = (
+        calculate_sell_liquidity(
+            sell_order_book["bids"],
+            buy_order_book["best_ask"],
+        )
+    )
+
+    if buy_liquidity < required_liquidity:
+
+        return None
+
+    if sell_liquidity < required_liquidity:
+
+        return None
+
+
+    # --------------------------------------------------------
+    # Симулируем реальную покупку по уровням стакана
+    # --------------------------------------------------------
+
+    buy_result = simulate_buy(
+        buy_order_book["asks"],
+        TRADE_AMOUNT_USD,
+    )
+
+    if not buy_result:
+
+        return None
+
+
+    # --------------------------------------------------------
+    # Комиссия покупки
+    # --------------------------------------------------------
+
+    buy_fee_percent = (
+        EXCHANGE_FEES.get(
+            buy_exchange,
+            0.10,
+        )
+    )
+
+    buy_cost = (
+        buy_result["spent"]
+        * (
+            1
+            + buy_fee_percent / 100
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # Симулируем продажу того же количества монет
+    # --------------------------------------------------------
+
+    sell_result = simulate_sell(
+        sell_order_book["bids"],
+        buy_result["quantity"],
+    )
+
+    if not sell_result:
+
+        return None
+
+
+    # --------------------------------------------------------
+    # Комиссия продажи
+    # --------------------------------------------------------
+
+    sell_fee_percent = (
+        EXCHANGE_FEES.get(
+            sell_exchange,
+            0.10,
+        )
+    )
+
+    sell_revenue = (
+        sell_result["revenue"]
+        * (
+            1
+            - sell_fee_percent / 100
+        )
+    )
+
+
+    # --------------------------------------------------------
     # Чистая прибыль
+    # --------------------------------------------------------
+
     net_profit_usd = (
         sell_revenue
         - buy_cost
@@ -544,13 +909,40 @@ def calculate_opportunity(
         / TRADE_AMOUNT_USD
     ) * 100
 
+
+    # --------------------------------------------------------
+    # Валовый спред по фактическим средним ценам
+    # --------------------------------------------------------
+
     gross_spread_percent = (
         (
-            sell_price
-            - buy_price
+            sell_result["average_price"]
+            - buy_result["average_price"]
         )
-        / buy_price
+        / buy_result["average_price"]
     ) * 100
+
+
+    # --------------------------------------------------------
+    # Проскальзывание
+    # --------------------------------------------------------
+
+    buy_slippage_percent = (
+        (
+            buy_result["average_price"]
+            - buy_order_book["best_ask"]
+        )
+        / buy_order_book["best_ask"]
+    ) * 100
+
+    sell_slippage_percent = (
+        (
+            sell_order_book["best_bid"]
+            - sell_result["average_price"]
+        )
+        / sell_order_book["best_bid"]
+    ) * 100
+
 
     return {
 
@@ -563,13 +955,25 @@ def calculate_opportunity(
         "buy_exchange_name":
             EXCHANGE_NAMES.get(
                 buy_exchange,
-                buy_exchange.upper()
+                buy_exchange.upper(),
             ),
 
         "buy_price":
             round(
-                buy_price,
-                8
+                buy_result["average_price"],
+                8,
+            ),
+
+        "buy_best_ask":
+            round(
+                buy_order_book["best_ask"],
+                8,
+            ),
+
+        "buy_exchange_liquidity":
+            round(
+                buy_liquidity,
+                2,
             ),
 
         "sell_exchange":
@@ -578,31 +982,46 @@ def calculate_opportunity(
         "sell_exchange_name":
             EXCHANGE_NAMES.get(
                 sell_exchange,
-                sell_exchange.upper()
+                sell_exchange.upper(),
             ),
 
         "sell_price":
             round(
-                sell_price,
-                8
+                sell_result["average_price"],
+                8,
             ),
+
+        "sell_best_bid":
+            round(
+                sell_order_book["best_bid"],
+                8,
+            ),
+
+        "sell_exchange_liquidity":
+            round(
+                sell_liquidity,
+                2,
+            ),
+
+        "quantity":
+            buy_result["quantity"],
 
         "gross_spread_percent":
             round(
                 gross_spread_percent,
-                4
+                4,
             ),
 
         "net_profit_percent":
             round(
                 net_profit_percent,
-                4
+                4,
             ),
 
         "net_profit_usd":
             round(
                 net_profit_usd,
-                2
+                2,
             ),
 
         "buy_fee_percent":
@@ -610,6 +1029,18 @@ def calculate_opportunity(
 
         "sell_fee_percent":
             sell_fee_percent,
+
+        "buy_slippage_percent":
+            round(
+                buy_slippage_percent,
+                4,
+            ),
+
+        "sell_slippage_percent":
+            round(
+                sell_slippage_percent,
+                4,
+            ),
     }
 
 
@@ -617,48 +1048,66 @@ def calculate_opportunity(
 # СКАНИРОВАНИЕ ОДНОЙ МОНЕТЫ
 # ============================================================
 
-def scan_symbol(symbol):
+def scan_symbol(
+    symbol
+):
 
-    prices = {}
-
-    for exchange_id in exchanges.keys():
-
-        price_data = get_price(
-            exchange_id,
+    # Параллельно получаем стаканы
+    # со всех доступных бирж
+    order_books = (
+        get_all_order_books_parallel(
             symbol
         )
-
-        if price_data:
-
-            prices[
-                exchange_id
-            ] = price_data
+    )
 
     opportunities = []
 
-    for buy_exchange, buy_data in prices.items():
+    exchange_ids = list(
+        order_books.keys()
+    )
 
-        for (
-            sell_exchange,
-            sell_data
-        ) in prices.items():
+    for buy_exchange in exchange_ids:
+
+        for sell_exchange in exchange_ids:
 
             if buy_exchange == sell_exchange:
                 continue
 
-            buy_price = buy_data["ask"]
-            sell_price = sell_data["bid"]
+            buy_order_book = (
+                order_books[
+                    buy_exchange
+                ]
+            )
 
-            if sell_price <= buy_price:
+            sell_order_book = (
+                order_books[
+                    sell_exchange
+                ]
+            )
+
+
+            # Быстрая предварительная проверка
+            if (
+                sell_order_book["best_bid"]
+                <= buy_order_book["best_ask"]
+            ):
+
                 continue
 
-            opportunity = calculate_opportunity(
-                symbol=symbol,
-                buy_exchange=buy_exchange,
-                buy_price=buy_price,
-                sell_exchange=sell_exchange,
-                sell_price=sell_price,
+
+            opportunity = (
+                calculate_order_book_opportunity(
+                    symbol=symbol,
+                    buy_exchange=buy_exchange,
+                    buy_order_book=buy_order_book,
+                    sell_exchange=sell_exchange,
+                    sell_order_book=sell_order_book,
+                )
             )
+
+            if not opportunity:
+                continue
+
 
             if (
                 opportunity[
@@ -692,7 +1141,7 @@ def scan_all():
 
     for index, symbol in enumerate(
         SYMBOLS,
-        start=1
+        start=1,
     ):
 
         with lock:
@@ -702,7 +1151,8 @@ def scan_all():
             current_symbol_index = index
 
         print(
-            f"🔍 Монета {index}/{len(SYMBOLS)}: "
+            f"🔍 Монета "
+            f"{index}/{len(SYMBOLS)}: "
             f"{symbol}"
         )
 
@@ -734,7 +1184,7 @@ def scan_all():
     all_opportunities.sort(
         key=lambda x:
             x["net_profit_percent"],
-        reverse=True
+        reverse=True,
     )
 
     return all_opportunities
@@ -759,7 +1209,7 @@ def send_opportunity_to_telegram(
     last_sent = (
         last_sent_notifications.get(
             notification_key,
-            0
+            0,
         )
     )
 
@@ -767,6 +1217,7 @@ def send_opportunity_to_telegram(
         current_time - last_sent
         < NOTIFICATION_COOLDOWN
     ):
+
         return False
 
     opportunity_id = str(
@@ -800,16 +1251,34 @@ def send_opportunity_to_telegram(
 
 🟢 <b>КУПИТЬ</b>
 <b>{opportunity['buy_exchange_name']}</b>
-💵 Цена: <b>${opportunity['buy_price']}</b>
+
+💵 Средняя цена по стакану:
+<b>${opportunity['buy_price']}</b>
+
+📚 Ликвидность стакана:
+<b>${opportunity['buy_exchange_liquidity']}</b>
+
 
 🔴 <b>ПРОДАТЬ</b>
 <b>{opportunity['sell_exchange_name']}</b>
-💵 Цена: <b>${opportunity['sell_price']}</b>
+
+💵 Средняя цена по стакану:
+<b>${opportunity['sell_price']}</b>
+
+📚 Ликвидность стакана:
+<b>${opportunity['sell_exchange_liquidity']}</b>
+
 
 📊 Валовый спред:
 <b>+{opportunity['gross_spread_percent']}%</b>
 
-📈 Чистая прибыль:
+📉 Проскальзывание покупки:
+<b>{opportunity['buy_slippage_percent']}%</b>
+
+📉 Проскальзывание продажи:
+<b>{opportunity['sell_slippage_percent']}%</b>
+
+📈 <b>Чистая прибыль после комиссий:</b>
 <b>+{opportunity['net_profit_percent']}%</b>
 
 💰 Размер сделки:
@@ -818,8 +1287,11 @@ def send_opportunity_to_telegram(
 💵 Ожидаемая прибыль:
 <b>+${opportunity['net_profit_usd']}</b>
 
-⚠️ После нажатия «ДА»
-цены будут проверены ещё раз.
+🔁 <b>ДВОЙНАЯ ПРОВЕРКА ВКЛЮЧЕНА</b>
+
+После нажатия «ДА» бот ещё раз
+параллельно проверит стаканы,
+ликвидность и актуальную прибыль.
 """
 
     reply_markup = {
@@ -829,7 +1301,7 @@ def send_opportunity_to_telegram(
 
                 {
                     "text":
-                        "✅ ДА — ПРОВЕРИТЬ",
+                        "🔄 ДА — ПОВТОРНО ПРОВЕРИТЬ",
 
                     "callback_data":
                         f"yes:{opportunity_id}",
@@ -848,7 +1320,7 @@ def send_opportunity_to_telegram(
 
     result = send_telegram_message(
         text,
-        reply_markup
+        reply_markup,
     )
 
     if (
@@ -872,14 +1344,14 @@ def send_opportunity_to_telegram(
 
     pending_opportunities.pop(
         opportunity_id,
-        None
+        None,
     )
 
     return False
 
 
 # ============================================================
-# ПОВТОРНАЯ ПРОВЕРКА
+# ПОВТОРНАЯ ПРОВЕРКА В TELEGRAM
 # ============================================================
 
 def recheck_opportunity(
@@ -894,24 +1366,23 @@ def recheck_opportunity(
 
         return (
             None,
-            "Возможность уже устарела."
+            "Возможность уже устарела.",
         )
 
-    # Возможность действует 5 минут
     if (
         time.time()
         - opportunity["created_at"]
-        > 300
+        > OPPORTUNITY_TTL
     ):
 
         pending_opportunities.pop(
             opportunity_id,
-            None
+            None,
         )
 
         return (
             None,
-            "Возможность устарела."
+            "Возможность устарела.",
         )
 
     symbol = opportunity["symbol"]
@@ -924,37 +1395,87 @@ def recheck_opportunity(
         opportunity["sell_exchange"]
     )
 
-    buy_data = get_price(
-        buy_exchange,
-        symbol
-    )
 
-    sell_data = get_price(
-        sell_exchange,
-        symbol
-    )
+    # --------------------------------------------------------
+    # ДВОЙНАЯ ПАРАЛЛЕЛЬНАЯ ПРОВЕРКА
+    # --------------------------------------------------------
 
-    if not buy_data or not sell_data:
+    with ThreadPoolExecutor(
+        max_workers=2
+    ) as executor:
+
+        buy_future = executor.submit(
+            get_order_book,
+            buy_exchange,
+            symbol,
+        )
+
+        sell_future = executor.submit(
+            get_order_book,
+            sell_exchange,
+            symbol,
+        )
+
+        try:
+
+            buy_order_book = (
+                buy_future.result()
+            )
+
+            sell_order_book = (
+                sell_future.result()
+            )
+
+        except Exception as e:
+
+            return (
+                None,
+                f"Ошибка повторной проверки: {e}",
+            )
+
+    if not buy_order_book:
 
         return (
             None,
-            "Не удалось получить "
-            "актуальные цены."
+            f"Не удалось получить "
+            f"актуальный стакан "
+            f"{buy_exchange}.",
         )
 
+    if not sell_order_book:
+
+        return (
+            None,
+            f"Не удалось получить "
+            f"актуальный стакан "
+            f"{sell_exchange}.",
+        )
+
+
+    # Проверяем реальную возможность
     current_opportunity = (
-        calculate_opportunity(
+        calculate_order_book_opportunity(
             symbol=symbol,
             buy_exchange=buy_exchange,
-            buy_price=buy_data["ask"],
+            buy_order_book=buy_order_book,
             sell_exchange=sell_exchange,
-            sell_price=sell_data["bid"],
+            sell_order_book=sell_order_book,
         )
     )
 
+    if not current_opportunity:
+
+        return (
+            None,
+            "После повторной проверки "
+            "недостаточно ликвидности "
+            "или сделка не может быть "
+            "полностью исполнена по стакану.",
+        )
+
     return (
         current_opportunity,
-        None
+        None,
     )
 
 
@@ -995,7 +1516,7 @@ def handle_callback(
 
         answer_callback_query(
             callback_id,
-            "Нет доступа."
+            "Нет доступа.",
         )
 
         return
@@ -1004,7 +1525,7 @@ def handle_callback(
 
         answer_callback_query(
             callback_id,
-            "Неизвестная команда."
+            "Неизвестная команда.",
         )
 
         return
@@ -1012,7 +1533,7 @@ def handle_callback(
     action, opportunity_id = (
         callback_data.split(
             ":",
-            1
+            1,
         )
     )
 
@@ -1025,12 +1546,12 @@ def handle_callback(
 
         pending_opportunities.pop(
             opportunity_id,
-            None
+            None,
         )
 
         answer_callback_query(
             callback_id,
-            "Сделка отменена."
+            "Сделка отменена.",
         )
 
         send_telegram_message(
@@ -1045,14 +1566,14 @@ def handle_callback(
 
 
     # ========================================================
-    # ДА
+    # ДА — ПОВТОРНАЯ ПРОВЕРКА
     # ========================================================
 
     if action == "yes":
 
         answer_callback_query(
             callback_id,
-            "Проверяю актуальные цены..."
+            "Параллельно проверяю стаканы...",
         )
 
         current, error = (
@@ -1063,20 +1584,28 @@ def handle_callback(
 
         pending_opportunities.pop(
             opportunity_id,
-            None
+            None,
         )
 
         if error:
 
             send_telegram_message(
                 f"""
-⚠️ <b>СДЕЛКА НЕ ВЫПОЛНЕНА</b>
+⚠️ <b>СДЕЛКА НЕ ПОДТВЕРЖДЕНА</b>
 
 {error}
+
+Никаких реальных ордеров
+выставлено не было.
 """
             )
 
             return
+
+
+        # ----------------------------------------------------
+        # Финальная проверка минимальной прибыли
+        # ----------------------------------------------------
 
         if (
             current[
@@ -1089,14 +1618,15 @@ def handle_callback(
                 f"""
 ⚠️ <b>СДЕЛКА ОТМЕНЕНА</b>
 
-Цены изменились.
+После повторной проверки
+цены изменились.
 
 🪙 <b>{current['symbol']}</b>
 
 📈 Новая чистая прибыль:
 <b>{current['net_profit_percent']}%</b>
 
-❌ Минимум:
+❌ Требуемый минимум:
 <b>{MIN_NET_PROFIT_PERCENT}%</b>
 
 Никаких реальных ордеров
@@ -1106,30 +1636,62 @@ def handle_callback(
 
             return
 
+
+        # ----------------------------------------------------
+        # ВОЗМОЖНОСТЬ ПОДТВЕРЖДЕНА
+        # ----------------------------------------------------
+
         send_telegram_message(
             f"""
 ✅ <b>ВОЗМОЖНОСТЬ ПОДТВЕРЖДЕНА</b>
 
 🪙 <b>{current['symbol']}</b>
 
+
 🟢 Купить:
 <b>{current['buy_exchange_name']}</b>
-${current['buy_price']}
+
+💵 Средняя цена исполнения:
+<b>${current['buy_price']}</b>
+
+📚 Ликвидность:
+<b>${current['buy_exchange_liquidity']}</b>
+
 
 🔴 Продать:
 <b>{current['sell_exchange_name']}</b>
-${current['sell_price']}
 
-📈 Актуальная чистая прибыль:
+💵 Средняя цена исполнения:
+<b>${current['sell_price']}</b>
+
+📚 Ликвидность:
+<b>${current['sell_exchange_liquidity']}</b>
+
+
+📊 Валовый спред:
+<b>+{current['gross_spread_percent']}%</b>
+
+📉 Проскальзывание покупки:
+<b>{current['buy_slippage_percent']}%</b>
+
+📉 Проскальзывание продажи:
+<b>{current['sell_slippage_percent']}%</b>
+
+
+📈 <b>АКТУАЛЬНАЯ ЧИСТАЯ ПРИБЫЛЬ:</b>
 <b>+{current['net_profit_percent']}%</b>
 
 💵 Ожидаемый результат:
 <b>+${current['net_profit_usd']}</b>
 
+
 🧪 <b>ТЕСТОВЫЙ РЕЖИМ</b>
 
+Проверка цен, стакана и ликвидности
+успешно пройдена.
+
 Реальные ордера пока
-НЕ выставляются.
+<b>НЕ выставляются.</b>
 """
         )
 
@@ -1252,6 +1814,11 @@ def scanner_loop():
                 f"{len(exchanges)}"
             )
 
+            print(
+                "⚡ Стаканы получаются "
+                "параллельно"
+            )
+
             opportunities = scan_all()
 
             with lock:
@@ -1283,6 +1850,7 @@ def scanner_loop():
                     sent_count
                     >= MAX_NOTIFICATIONS_PER_SCAN
                 ):
+
                     break
 
                 sent = (
@@ -1324,7 +1892,6 @@ def start_background_services():
 
     with startup_lock:
 
-        # Защита от повторного запуска
         if services_started:
             return
 
@@ -1351,12 +1918,25 @@ def start_background_services():
             f"{len(exchanges)}"
         )
 
+        print(
+            f"📈 Минимальная прибыль: "
+            f"{MIN_NET_PROFIT_PERCENT}%"
+        )
+
+        print(
+            "📚 Проверка стакана "
+            "и ликвидности: ВКЛ"
+        )
+
+        print(
+            "⚡ Параллельные запросы: ВКЛ"
+        )
+
         telegram_ok = (
             check_telegram_connection()
         )
 
 
-        # Запускаем Telegram
         if telegram_ok:
 
             telegram_thread = (
@@ -1379,7 +1959,6 @@ def start_background_services():
             )
 
 
-        # Запускаем сканер
         scanner_thread = (
             threading.Thread(
                 target=scanner_loop,
@@ -1540,6 +2119,12 @@ body {
     margin-top: 10px;
 }
 
+.small-info {
+    margin-top: 12px;
+    color: #b8c2d2;
+    font-size: 17px;
+}
+
 .empty {
     text-align: center;
     padding: 40px 20px;
@@ -1638,8 +2223,8 @@ body {
 
 <br><br>
 
-🪙 Всего монет:
-<b>{{ total_coins }}</b>
+⚡ Данные со всех бирж
+получаются параллельно.
 
 {% endif %}
 
@@ -1655,6 +2240,26 @@ body {
 
 💸 Размер сделки:
 <b>${{ trade_amount }}</b>
+
+<br><br>
+
+📚 Проверка стакана:
+<b>ВКЛЮЧЕНА</b>
+
+<br><br>
+
+💧 Запас ликвидности:
+<b>20%</b>
+
+<br><br>
+
+⚡ Параллельные запросы:
+<b>ВКЛЮЧЕНЫ</b>
+
+<br><br>
+
+🔁 Двойная проверка Telegram:
+<b>ВКЛЮЧЕНА</b>
 
 <br><br>
 
@@ -1734,7 +2339,19 @@ body {
 </div>
 
 <div class="price">
-${{ op.buy_price }}
+Средняя цена: ${{ op.buy_price }}
+</div>
+
+<div class="small-info">
+Лучший Ask: ${{ op.buy_best_ask }}
+</div>
+
+<div class="small-info">
+Ликвидность: ${{ op.buy_exchange_liquidity }}
+</div>
+
+<div class="small-info">
+Проскальзывание: {{ op.buy_slippage_percent }}%
 </div>
 
 </div>
@@ -1749,7 +2366,19 @@ ${{ op.buy_price }}
 </div>
 
 <div class="price">
-${{ op.sell_price }}
+Средняя цена: ${{ op.sell_price }}
+</div>
+
+<div class="small-info">
+Лучший Bid: ${{ op.sell_best_bid }}
+</div>
+
+<div class="small-info">
+Ликвидность: ${{ op.sell_exchange_liquidity }}
+</div>
+
+<div class="small-info">
+Проскальзывание: {{ op.sell_slippage_percent }}%
 </div>
 
 </div>
@@ -1769,6 +2398,12 @@ ${{ op.sell_price }}
 Бот продолжает искать среди
 <b>{{ total_coins }}</b> монет
 на <b>{{ exchanges_count }}</b> биржах.
+
+<br><br>
+
+Проверяются реальные стаканы,
+ликвидность, комиссии
+и проскальзывание.
 
 </div>
 
@@ -1913,6 +2548,18 @@ def scan_api():
         "telegram_active":
             telegram_started,
 
+        "parallel_requests":
+            True,
+
+        "order_book_check":
+            True,
+
+        "liquidity_check":
+            True,
+
+        "double_telegram_check":
+            True,
+
         "total_coins":
             len(SYMBOLS),
 
@@ -1982,6 +2629,18 @@ def health():
         "telegram_polling":
             telegram_started,
 
+        "parallel_requests":
+            True,
+
+        "order_book_check":
+            True,
+
+        "liquidity_check":
+            True,
+
+        "double_telegram_check":
+            True,
+
         "min_profit":
             MIN_NET_PROFIT_PERCENT,
 
@@ -2028,7 +2687,7 @@ if __name__ == "__main__":
     port = int(
         os.getenv(
             "PORT",
-            5000
+            5000,
         )
     )
 
