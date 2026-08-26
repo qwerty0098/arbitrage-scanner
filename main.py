@@ -65,7 +65,7 @@ EXCHANGE_NAMES = {
 
 
 # ============================================================
-# МОНЕТЫ
+# МОНЕТЫ — ВСЕГО 16
 # ============================================================
 
 SYMBOLS = [
@@ -77,6 +77,16 @@ SYMBOLS = [
     "DOGE/USDT",
     "AVAX/USDT",
     "LINK/USDT",
+
+    # Новые 8 монет
+    "BNB/USDT",
+    "TRX/USDT",
+    "DOT/USDT",
+    "LTC/USDT",
+    "BCH/USDT",
+    "UNI/USDT",
+    "NEAR/USDT",
+    "APT/USDT",
 ]
 
 
