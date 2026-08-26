@@ -28,7 +28,7 @@ TELEGRAM_CHAT_ID = str(
 
 
 # Размер одной сделки в USDT / USD
-TRADE_AMOUNT_USD = 1000
+TRADE_AMOUNT_USD = 11.85 
 
 # Минимальная чистая прибыль
 MIN_NET_PROFIT_PERCENT = 0.30
