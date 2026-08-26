@@ -27,43 +27,29 @@ TELEGRAM_CHAT_ID = str(
 ).strip()
 
 
-# Размер одной сделки в USDT / USD
-TRADE_AMOUNT_USD = 11.85 
+# ============================================================
+# РАЗМЕР СДЕЛКИ
+# ============================================================
 
-# Минимальная чистая прибыль
-MIN_NET_PROFIT_PERCENT = 0.20
-
-# Интервал полного сканирования
-SCAN_INTERVAL = 15
-
-# Интервал повторной проверки Telegram
-TELEGRAM_POLL_INTERVAL = 2
-
-# Не отправлять одинаковую связку слишком часто
-NOTIFICATION_COOLDOWN = 300
-
-# Сколько возможностей максимум отправлять за один скан
-MAX_NOTIFICATIONS_PER_SCAN = 3
-
-# Возможность в Telegram действует 5 минут
-OPPORTUNITY_TTL = 300
-
-# Глубина стакана для проверки
-ORDER_BOOK_LIMIT = 20
-
-# Запас ликвидности.
-# Для сделки на $1000 желательно иметь минимум
-# $1200 ликвидности в стакане.
-LIQUIDITY_SAFETY_MULTIPLIER = 1.20
-
-# Количество потоков для параллельных запросов
-MAX_WORKERS = 9
+# Фактический бюджет на одну сделку.
+# Это сумма, которую бот готов использовать на ПОКУПКУ
+# вместе с запасом на комиссию.
+TRADE_AMOUNT_USD = 1000.0
 
 
 # ============================================================
-# БИРЖИ И КОМИССИИ
+# ПРИБЫЛЬ И КОМИССИИ
 # ============================================================
 
+# Минимальная чистая прибыль после комиссий и исполнения
+MIN_NET_PROFIT_PERCENT = 0.50
+
+# Дополнительный запас на непредвиденные расходы:
+# изменение комиссии, небольшое ухудшение цены и т.д.
+EXTRA_COST_BUFFER_PERCENT = 0.10
+
+# Комиссии считаются как taker-комиссии.
+# При необходимости их можно изменить под свой аккаунт.
 EXCHANGE_FEES = {
     "binance": 0.10,
     "okx": 0.10,
@@ -76,6 +62,98 @@ EXCHANGE_FEES = {
     "htx": 0.20,
 }
 
+
+# ============================================================
+# СКАНИРОВАНИЕ
+# ============================================================
+
+# Интервал между полными сканированиями
+SCAN_INTERVAL = 10
+
+# Сколько возможностей максимум отправлять за один скан
+MAX_NOTIFICATIONS_PER_SCAN = 3
+
+# Не отправлять одну и ту же связку слишком часто
+NOTIFICATION_COOLDOWN = 300
+
+# Возможность живёт 5 минут
+OPPORTUNITY_TTL = 300
+
+# Как часто чистить устаревшие данные
+CLEANUP_INTERVAL = 60
+
+
+# ============================================================
+# СВЕЖЕСТЬ СТАКАНА
+# ============================================================
+
+# Максимальный возраст стакана в секундах.
+# Если биржа передала timestamp и стакан старше этого
+# значения, возможность игнорируется.
+MAX_ORDER_BOOK_AGE_SECONDS = 5
+
+# Если timestamp отсутствует, данные всё равно могут быть
+# использованы, но помечаются как менее надёжные.
+ALLOW_ORDER_BOOK_WITHOUT_TIMESTAMP = True
+
+
+# ============================================================
+# ЛИКВИДНОСТЬ И ИСПОЛНЕНИЕ
+# ============================================================
+
+# Сколько уровней стакана запрашивать
+ORDER_BOOK_LIMIT = 50
+
+# Минимальный запас ликвидности относительно размера сделки
+LIQUIDITY_SAFETY_MULTIPLIER = 1.20
+
+# Максимально допустимое проскальзывание на покупке
+MAX_BUY_SLIPPAGE_PERCENT = 0.30
+
+# Максимально допустимое проскальзывание на продаже
+MAX_SELL_SLIPPAGE_PERCENT = 0.30
+
+# Максимальный процент отклонения цены от лучшей цены,
+# в пределах которого считаем ликвидность.
+MAX_EXECUTION_PRICE_DEVIATION_PERCENT = 0.50
+
+
+# ============================================================
+# ПАРАЛЛЕЛЬНОСТЬ
+# ============================================================
+
+# Один постоянный общий пул потоков.
+# Он создаётся только один раз.
+MAX_WORKERS = 36
+
+# Одновременно сканируем несколько монет
+MAX_PARALLEL_SYMBOLS = 4
+
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+TELEGRAM_POLL_INTERVAL = 2
+TELEGRAM_LONG_POLL_TIMEOUT = 20
+
+
+# ============================================================
+# 4 САМЫЕ ЛИКВИДНЫЕ МОНЕТЫ
+# ============================================================
+
+SYMBOLS = [
+    "BTC/USDT",
+    "ETH/USDT",
+    "SOL/USDT",
+    "XRP/USDT",
+]
+
+
+# ============================================================
+# БИРЖИ — ВСЕГО 9
+# ============================================================
+
 EXCHANGE_NAMES = {
     "binance": "BINANCE",
     "okx": "OKX",
@@ -87,35 +165,6 @@ EXCHANGE_NAMES = {
     "gate": "GATE.IO",
     "htx": "HTX",
 }
-
-
-# ============================================================
-# МОНЕТЫ — ВСЕГО 16
-# ============================================================
-
-SYMBOLS = [
-    "BTC/USDT",
-    "ETH/USDT",
-    "SOL/USDT",
-    "XRP/USDT",
-    "ADA/USDT",
-    "DOGE/USDT",
-    "AVAX/USDT",
-    "LINK/USDT",
-    "BNB/USDT",
-    "TRX/USDT",
-    "DOT/USDT",
-    "LTC/USDT",
-    "BCH/USDT",
-    "UNI/USDT",
-    "NEAR/USDT",
-    "APT/USDT",
-]
-
-
-# ============================================================
-# ПОДКЛЮЧАЕМЫЕ БИРЖИ — ВСЕГО 9
-# ============================================================
 
 EXCHANGE_CLASSES = {
     "binance": ccxt.binance,
@@ -138,30 +187,41 @@ app = Flask(__name__)
 
 
 # ============================================================
+# ПОСТОЯННЫЙ ПУЛ ПОТОКОВ
+# ============================================================
+
+executor = ThreadPoolExecutor(
+    max_workers=MAX_WORKERS,
+    thread_name_prefix="arbitrage-worker",
+)
+
+
+# ============================================================
 # СОЗДАНИЕ БИРЖ
 # ============================================================
 
 exchanges = {}
+available_symbols_by_exchange = {}
 
 for exchange_id, exchange_class in EXCHANGE_CLASSES.items():
 
     try:
 
-        exchanges[exchange_id] = exchange_class({
+        exchange = exchange_class({
             "enableRateLimit": True,
             "timeout": 15000,
         })
 
+        exchanges[exchange_id] = exchange
+
         print(
-            f"✅ Подключена биржа: "
-            f"{exchange_id}"
+            f"✅ Создано подключение: {exchange_id}"
         )
 
     except Exception as e:
 
         print(
-            f"❌ Ошибка подключения "
-            f"{exchange_id}: {e}"
+            f"❌ Ошибка создания {exchange_id}: {e}"
         )
 
 
@@ -179,15 +239,114 @@ scanner_started = False
 telegram_started = False
 services_started = False
 
-current_symbol = None
-current_symbol_index = 0
+current_symbols = []
 current_scan_total = len(SYMBOLS)
 
 total_scans = 0
 total_opportunities_found = 0
 
-lock = threading.Lock()
+total_order_book_requests = 0
+total_successful_order_books = 0
+
+lock = threading.RLock()
+notification_lock = threading.RLock()
+pending_lock = threading.RLock()
 startup_lock = threading.Lock()
+stats_lock = threading.Lock()
+
+
+# ============================================================
+# ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ БЕЗОПАСНОГО ЧИСЛА
+# ============================================================
+
+def safe_float(
+    value,
+    default=0.0
+):
+
+    try:
+
+        return float(value)
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        return default
+
+
+# ============================================================
+# ЗАГРУЗКА MARKETS ОДИН РАЗ
+# ============================================================
+
+def load_all_markets():
+
+    global available_symbols_by_exchange
+
+    print("")
+    print(
+        "=========================================="
+    )
+    print(
+        "📚 ЗАГРУЗКА MARKETS"
+    )
+    print(
+        "=========================================="
+    )
+
+    futures = {}
+
+    for exchange_id, exchange in exchanges.items():
+
+        futures[
+            executor.submit(
+                exchange.load_markets
+            )
+        ] = exchange_id
+
+    for future in as_completed(futures):
+
+        exchange_id = futures[future]
+
+        try:
+
+            markets = future.result()
+
+            supported = set()
+
+            for symbol in SYMBOLS:
+
+                if symbol in markets:
+
+                    supported.add(
+                        symbol
+                    )
+
+            available_symbols_by_exchange[
+                exchange_id
+            ] = supported
+
+            print(
+                f"✅ {exchange_id}: "
+                f"{len(supported)}/{len(SYMBOLS)} "
+                f"монет доступно"
+            )
+
+        except Exception as e:
+
+            available_symbols_by_exchange[
+                exchange_id
+            ] = set()
+
+            print(
+                f"❌ load_markets {exchange_id}: {e}"
+            )
+
+    print(
+        "=========================================="
+    )
+    print("")
 
 
 # ============================================================
@@ -201,10 +360,6 @@ def telegram_api(
 ):
 
     if not TELEGRAM_BOT_TOKEN:
-
-        print(
-            "❌ TELEGRAM_BOT_TOKEN отсутствует"
-        )
 
         return None
 
@@ -220,7 +375,7 @@ def telegram_api(
             response = requests.get(
                 url,
                 params=data or {},
-                timeout=30,
+                timeout=35,
             )
 
         else:
@@ -228,7 +383,7 @@ def telegram_api(
             response = requests.post(
                 url,
                 json=data or {},
-                timeout=20,
+                timeout=25,
             )
 
         result = response.json()
@@ -236,8 +391,7 @@ def telegram_api(
         if not result.get("ok"):
 
             print(
-                f"❌ Telegram API {method}: "
-                f"{result}"
+                f"❌ Telegram {method}: {result}"
             )
 
         return result
@@ -245,15 +399,14 @@ def telegram_api(
     except Exception as e:
 
         print(
-            f"❌ Telegram API ошибка "
-            f"({method}): {e}"
+            f"❌ Telegram API {method}: {e}"
         )
 
         return None
 
 
 # ============================================================
-# ОТПРАВКА TELEGRAM СООБЩЕНИЯ
+# ОТПРАВКА TELEGRAM
 # ============================================================
 
 def send_telegram_message(
@@ -264,8 +417,7 @@ def send_telegram_message(
     if not TELEGRAM_BOT_TOKEN:
 
         print(
-            "❌ Невозможно отправить Telegram: "
-            "нет TOKEN"
+            "❌ TELEGRAM_BOT_TOKEN отсутствует"
         )
 
         return None
@@ -273,8 +425,7 @@ def send_telegram_message(
     if not TELEGRAM_CHAT_ID:
 
         print(
-            "❌ Невозможно отправить Telegram: "
-            "нет CHAT_ID"
+            "❌ TELEGRAM_CHAT_ID отсутствует"
         )
 
         return None
@@ -287,7 +438,9 @@ def send_telegram_message(
 
     if reply_markup:
 
-        data["reply_markup"] = reply_markup
+        data[
+            "reply_markup"
+        ] = reply_markup
 
     return telegram_api(
         "sendMessage",
@@ -346,10 +499,6 @@ def check_telegram_connection():
 
         return False
 
-    print(
-        "🔑 Проверяю Telegram токен..."
-    )
-
     result = telegram_api(
         "getMe",
         request_method="GET"
@@ -358,7 +507,7 @@ def check_telegram_connection():
     if not result or not result.get("ok"):
 
         print(
-            "❌ TELEGRAM ТОКЕН НЕ РАБОТАЕТ"
+            "❌ TELEGRAM TOKEN НЕ РАБОТАЕТ"
         )
 
         return False
@@ -370,19 +519,7 @@ def check_telegram_connection():
 
     bot_name = bot.get(
         "username",
-        "неизвестно"
-    )
-
-    print(
-        "✅ Telegram токен работает"
-    )
-
-    print(
-        f"🤖 Бот: @{bot_name}"
-    )
-
-    print(
-        f"💬 Chat ID: {TELEGRAM_CHAT_ID}"
+        "unknown"
     )
 
     startup_text = f"""
@@ -391,59 +528,116 @@ def check_telegram_connection():
 🤖 Бот:
 <b>@{bot_name}</b>
 
-💰 Размер сделки:
-<b>${TRADE_AMOUNT_USD}</b>
+💰 Фактический бюджет сделки:
+<b>${TRADE_AMOUNT_USD:,.2f}</b>
 
 📈 Минимальная чистая прибыль:
 <b>{MIN_NET_PROFIT_PERCENT}%</b>
 
-🔄 Интервал сканирования:
-<b>{SCAN_INTERVAL} секунд</b>
-
-🪙 Всего монет:
+🪙 Монет:
 <b>{len(SYMBOLS)}</b>
 
-🏦 Бирж подключено:
+🏦 Бирж:
 <b>{len(exchanges)}</b>
 
-⚡ Цены и стаканы получаются
-параллельно со всех бирж.
+⚡ Постоянный пул потоков:
+<b>ВКЛЮЧЕН</b>
 
-📚 Включена проверка:
-<b>стакана и ликвидности</b>
+📚 Markets загружаются:
+<b>ОДИН РАЗ ПРИ СТАРТЕ</b>
 
-🔁 После нажатия кнопки
-выполняется повторная проверка.
+📖 Проверка стакана:
+<b>ВКЛЮЧЕНА</b>
+
+💧 Проверка ликвидности
+в зоне исполнения:
+<b>ВКЛЮЧЕНА</b>
+
+🕒 Проверка свежести стакана:
+<b>ВКЛЮЧЕНА</b>
+
+🔁 Двойная проверка Telegram:
+<b>ВКЛЮЧЕНА</b>
+
+⭐ Рейтинг качества возможностей:
+<b>ВКЛЮЧЕН</b>
+
+🧪 <b>ТЕСТОВЫЙ РЕЖИМ</b>
+Реальные ордера не выставляются.
 """
 
-    send_result = send_telegram_message(
+    result = send_telegram_message(
         startup_text
     )
 
-    if (
-        send_result
-        and send_result.get("ok")
-    ):
+    if result and result.get("ok"):
 
         print(
-            "✅ Стартовое сообщение "
-            "отправлено в Telegram"
+            "✅ Telegram подключён"
         )
-
-    else:
 
         print(
-            "❌ Telegram токен работает, "
-            "но сообщение не отправлено"
+            f"🤖 @{bot_name}"
         )
 
-        return False
+        print(
+            "=========================================="
+        )
+
+        return True
 
     print(
-        "=========================================="
+        "❌ Не удалось отправить стартовое сообщение"
     )
 
-    return True
+    return False
+
+
+# ============================================================
+# ОЧИСТКА СТАКАНА
+# ============================================================
+
+def clean_order_levels(
+    levels
+):
+
+    clean_levels = []
+
+    if not levels:
+
+        return clean_levels
+
+    for level in levels:
+
+        if not isinstance(
+            level,
+            (list, tuple),
+        ):
+
+            continue
+
+        if len(level) < 2:
+
+            continue
+
+        price = safe_float(
+            level[0]
+        )
+
+        amount = safe_float(
+            level[1]
+        )
+
+        if (
+            price > 0
+            and amount > 0
+        ):
+
+            clean_levels.append(
+                [price, amount]
+            )
+
+    return clean_levels
 
 
 # ============================================================
@@ -455,6 +649,9 @@ def get_order_book(
     symbol
 ):
 
+    global total_order_book_requests
+    global total_successful_order_books
+
     exchange = exchanges.get(
         exchange_id
     )
@@ -463,6 +660,26 @@ def get_order_book(
 
         return None
 
+    supported_symbols = (
+        available_symbols_by_exchange.get(
+            exchange_id,
+            set(),
+        )
+    )
+
+    if (
+        supported_symbols
+        and symbol not in supported_symbols
+    ):
+
+        return None
+
+    request_started_at = time.time()
+
+    with stats_lock:
+
+        total_order_book_requests += 1
+
     try:
 
         order_book = exchange.fetch_order_book(
@@ -470,67 +687,114 @@ def get_order_book(
             limit=ORDER_BOOK_LIMIT,
         )
 
-        asks = order_book.get(
-            "asks",
-            []
+        received_at = time.time()
+
+        asks = clean_order_levels(
+            order_book.get(
+                "asks",
+                [],
+            )
         )
 
-        bids = order_book.get(
-            "bids",
-            []
+        bids = clean_order_levels(
+            order_book.get(
+                "bids",
+                [],
+            )
         )
 
         if not asks or not bids:
 
             return None
 
-        clean_asks = []
-        clean_bids = []
+        asks.sort(
+            key=lambda x: x[0]
+        )
 
-        for level in asks:
+        bids.sort(
+            key=lambda x: x[0],
+            reverse=True,
+        )
 
-            if len(level) < 2:
-                continue
+        exchange_timestamp = (
+            order_book.get(
+                "timestamp"
+            )
+        )
 
-            price = float(level[0])
-            amount = float(level[1])
+        timestamp_age = None
 
-            if price > 0 and amount > 0:
+        if exchange_timestamp:
 
-                clean_asks.append(
-                    [price, amount]
+            try:
+
+                timestamp_seconds = (
+                    float(exchange_timestamp)
+                    / 1000
                 )
 
-        for level in bids:
-
-            if len(level) < 2:
-                continue
-
-            price = float(level[0])
-            amount = float(level[1])
-
-            if price > 0 and amount > 0:
-
-                clean_bids.append(
-                    [price, amount]
+                timestamp_age = (
+                    received_at
+                    - timestamp_seconds
                 )
 
-        if not clean_asks or not clean_bids:
+            except Exception:
+
+                timestamp_age = None
+
+        is_fresh = True
+
+        if timestamp_age is not None:
+
+            if (
+                timestamp_age
+                > MAX_ORDER_BOOK_AGE_SECONDS
+            ):
+
+                is_fresh = False
+
+        elif not ALLOW_ORDER_BOOK_WITHOUT_TIMESTAMP:
+
+            is_fresh = False
+
+        if not is_fresh:
 
             return None
 
+        with stats_lock:
+
+            total_successful_order_books += 1
+
         return {
-            "asks": clean_asks,
-            "bids": clean_bids,
-            "best_ask": clean_asks[0][0],
-            "best_bid": clean_bids[0][0],
+
+            "asks": asks,
+
+            "bids": bids,
+
+            "best_ask":
+                asks[0][0],
+
+            "best_bid":
+                bids[0][0],
+
+            "exchange_timestamp":
+                exchange_timestamp,
+
+            "timestamp_age":
+                timestamp_age,
+
+            "received_at":
+                received_at,
+
+            "request_duration":
+                received_at
+                - request_started_at,
         }
 
     except Exception as e:
 
         print(
-            f"⚠️ Ошибка стакана "
-            f"{exchange_id} "
+            f"⚠️ Стакан {exchange_id} "
             f"{symbol}: {e}"
         )
 
@@ -547,68 +811,96 @@ def get_all_order_books_parallel(
 
     results = {}
 
-    exchange_ids = list(
-        exchanges.keys()
-    )
+    futures = {}
 
-    if not exchange_ids:
+    for exchange_id in exchanges:
 
-        return results
-
-    workers = min(
-        MAX_WORKERS,
-        len(exchange_ids)
-    )
-
-    with ThreadPoolExecutor(
-        max_workers=workers
-    ) as executor:
-
-        future_to_exchange = {
-
-            executor.submit(
-                get_order_book,
+        supported_symbols = (
+            available_symbols_by_exchange.get(
                 exchange_id,
-                symbol,
-            ): exchange_id
+                set(),
+            )
+        )
 
-            for exchange_id
-            in exchange_ids
-        }
-
-        for future in as_completed(
-            future_to_exchange
+        if (
+            supported_symbols
+            and symbol not in supported_symbols
         ):
 
-            exchange_id = (
-                future_to_exchange[
-                    future
-                ]
+            continue
+
+        future = executor.submit(
+            get_order_book,
+            exchange_id,
+            symbol,
+        )
+
+        futures[
+            future
+        ] = exchange_id
+
+    for future in as_completed(
+        futures
+    ):
+
+        exchange_id = futures[
+            future
+        ]
+
+        try:
+
+            order_book = future.result()
+
+            if order_book:
+
+                results[
+                    exchange_id
+                ] = order_book
+
+        except Exception as e:
+
+            print(
+                f"⚠️ Параллельная ошибка "
+                f"{exchange_id} {symbol}: {e}"
             )
-
-            try:
-
-                order_book = future.result()
-
-                if order_book:
-
-                    results[
-                        exchange_id
-                    ] = order_book
-
-            except Exception as e:
-
-                print(
-                    f"⚠️ Параллельная ошибка "
-                    f"{exchange_id} "
-                    f"{symbol}: {e}"
-                )
 
     return results
 
 
 # ============================================================
-# РАСЧЁТ ПОКУПКИ ПО СТАКАНУ
+# РАСЧЁТ МАКСИМАЛЬНОЙ СУММЫ ПОКУПКИ
+# ============================================================
+
+def calculate_buy_budget():
+
+    # Бюджет включает возможную комиссию.
+    # Например, если бюджет $1000, нельзя купить
+    # ровно на $1000 и потом сверху добавить комиссию.
+    # Поэтому заранее оставляем место для комиссии
+    # и дополнительного буфера.
+
+    highest_fee = max(
+        EXCHANGE_FEES.values()
+    )
+
+    reserve_percent = (
+        highest_fee
+        + EXTRA_COST_BUFFER_PERCENT
+    )
+
+    available_for_asset = (
+        TRADE_AMOUNT_USD
+        / (
+            1
+            + reserve_percent / 100
+        )
+    )
+
+    return available_for_asset
+
+
+# ============================================================
+# СИМУЛЯЦИЯ ПОКУПКИ
 # ============================================================
 
 def simulate_buy(
@@ -620,30 +912,46 @@ def simulate_buy(
 
         return None
 
-    remaining_usd = float(
+    remaining_usd = safe_float(
         quote_amount
     )
 
     total_spent = 0.0
     total_quantity = 0.0
 
-    for level in asks:
+    best_ask = asks[0][0]
 
-        price = float(level[0])
-        available_quantity = float(
-            level[1]
+    max_price = (
+        best_ask
+        * (
+            1
+            + MAX_EXECUTION_PRICE_DEVIATION_PERCENT
+            / 100
         )
+    )
 
-        if price <= 0:
+    for price, available_quantity in asks:
+
+        if (
+            price <= 0
+            or available_quantity <= 0
+        ):
+
             continue
+
+        # Не используем слишком далёкие уровни
+        if price > max_price:
+
+            break
+
+        if remaining_usd <= 0:
+
+            break
 
         level_value = (
             price
             * available_quantity
         )
-
-        if remaining_usd <= 0:
-            break
 
         spend = min(
             remaining_usd,
@@ -657,7 +965,6 @@ def simulate_buy(
 
         total_spent += spend
         total_quantity += quantity
-
         remaining_usd -= spend
 
     if remaining_usd > 0.000001:
@@ -674,14 +981,23 @@ def simulate_buy(
     )
 
     return {
-        "spent": total_spent,
-        "quantity": total_quantity,
-        "average_price": average_price,
+
+        "spent":
+            total_spent,
+
+        "quantity":
+            total_quantity,
+
+        "average_price":
+            average_price,
+
+        "max_price":
+            max_price,
     }
 
 
 # ============================================================
-# РАСЧЁТ ПРОДАЖИ ПО СТАКАНУ
+# СИМУЛЯЦИЯ ПРОДАЖИ
 # ============================================================
 
 def simulate_sell(
@@ -693,24 +1009,40 @@ def simulate_sell(
 
         return None
 
-    remaining_quantity = float(
+    remaining_quantity = safe_float(
         quantity
     )
 
     total_revenue = 0.0
     total_sold = 0.0
 
-    for level in bids:
+    best_bid = bids[0][0]
 
-        price = float(level[0])
-        available_quantity = float(
-            level[1]
+    min_price = (
+        best_bid
+        * (
+            1
+            - MAX_EXECUTION_PRICE_DEVIATION_PERCENT
+            / 100
         )
+    )
 
-        if price <= 0:
+    for price, available_quantity in bids:
+
+        if (
+            price <= 0
+            or available_quantity <= 0
+        ):
+
             continue
 
+        # Не продаём по слишком плохой цене
+        if price < min_price:
+
+            break
+
         if remaining_quantity <= 0:
+
             break
 
         sell_quantity = min(
@@ -723,7 +1055,9 @@ def simulate_sell(
             * price
         )
 
-        total_sold += sell_quantity
+        total_sold += (
+            sell_quantity
+        )
 
         remaining_quantity -= (
             sell_quantity
@@ -743,49 +1077,260 @@ def simulate_sell(
     )
 
     return {
-        "revenue": total_revenue,
-        "quantity": total_sold,
-        "average_price": average_price,
+
+        "revenue":
+            total_revenue,
+
+        "quantity":
+            total_sold,
+
+        "average_price":
+            average_price,
+
+        "min_price":
+            min_price,
     }
 
 
 # ============================================================
-# ПРОВЕРКА ЛИКВИДНОСТИ ПО СТАКАНУ
+# ЛИКВИДНОСТЬ В ЗОНЕ ИСПОЛНЕНИЯ
 # ============================================================
 
-def calculate_buy_liquidity(
+def calculate_buy_execution_liquidity(
     asks
 ):
 
-    return sum(
-        float(price)
-        * float(amount)
-
-        for price, amount
-        in asks
-    )
-
-
-def calculate_sell_liquidity(
-    bids,
-    reference_price
-):
-
-    if reference_price <= 0:
+    if not asks:
 
         return 0.0
 
-    return sum(
-        float(price)
-        * float(amount)
+    best_ask = asks[0][0]
 
-        for price, amount
-        in bids
+    max_price = (
+        best_ask
+        * (
+            1
+            + MAX_EXECUTION_PRICE_DEVIATION_PERCENT
+            / 100
+        )
+    )
+
+    liquidity = 0.0
+
+    for price, amount in asks:
+
+        if price > max_price:
+
+            break
+
+        liquidity += (
+            price
+            * amount
+        )
+
+    return liquidity
+
+
+def calculate_sell_execution_liquidity(
+    bids
+):
+
+    if not bids:
+
+        return 0.0
+
+    best_bid = bids[0][0]
+
+    min_price = (
+        best_bid
+        * (
+            1
+            - MAX_EXECUTION_PRICE_DEVIATION_PERCENT
+            / 100
+        )
+    )
+
+    liquidity = 0.0
+
+    for price, amount in bids:
+
+        if price < min_price:
+
+            break
+
+        liquidity += (
+            price
+            * amount
+        )
+
+    return liquidity
+
+
+# ============================================================
+# БЫСТРЫЙ ПРЕДВАРИТЕЛЬНЫЙ ФИЛЬТР
+# ============================================================
+
+def passes_fast_precheck(
+    buy_exchange,
+    buy_order_book,
+    sell_exchange,
+    sell_order_book
+):
+
+    buy_ask = buy_order_book[
+        "best_ask"
+    ]
+
+    sell_bid = sell_order_book[
+        "best_bid"
+    ]
+
+    if sell_bid <= buy_ask:
+
+        return False
+
+    buy_fee = EXCHANGE_FEES.get(
+        buy_exchange,
+        0.20,
+    )
+
+    sell_fee = EXCHANGE_FEES.get(
+        sell_exchange,
+        0.20,
+    )
+
+    minimum_required_spread = (
+        buy_fee
+        + sell_fee
+        + EXTRA_COST_BUFFER_PERCENT
+        + MIN_NET_PROFIT_PERCENT
+    )
+
+    gross_spread = (
+        (
+            sell_bid
+            - buy_ask
+        )
+        / buy_ask
+    ) * 100
+
+    return (
+        gross_spread
+        >= minimum_required_spread
     )
 
 
 # ============================================================
-# РАСЧЁТ АРБИТРАЖА ПО РЕАЛЬНЫМ СТАКАНАМ
+# РЕЙТИНГ КАЧЕСТВА ВОЗМОЖНОСТИ
+# ============================================================
+
+def calculate_opportunity_score(
+    net_profit_percent,
+    gross_spread_percent,
+    buy_slippage_percent,
+    sell_slippage_percent,
+    buy_liquidity,
+    sell_liquidity,
+):
+
+    # 0-40 баллов за чистую прибыль
+    profit_score = min(
+        40.0,
+        max(
+            0.0,
+            (
+                net_profit_percent
+                / 2.0
+            )
+            * 40.0,
+        ),
+    )
+
+    # 0-15 баллов за валовый спред
+    spread_score = min(
+        15.0,
+        max(
+            0.0,
+            (
+                gross_spread_percent
+                / 3.0
+            )
+            * 15.0,
+        ),
+    )
+
+    # 0-20 баллов за ликвидность
+    required_liquidity = (
+        TRADE_AMOUNT_USD
+        * LIQUIDITY_SAFETY_MULTIPLIER
+    )
+
+    min_liquidity = min(
+        buy_liquidity,
+        sell_liquidity,
+    )
+
+    liquidity_ratio = (
+        min_liquidity
+        / required_liquidity
+        if required_liquidity > 0
+        else 0
+    )
+
+    liquidity_score = min(
+        20.0,
+        liquidity_ratio * 10.0,
+    )
+
+    # 0-25 баллов за низкое проскальзывание
+    total_slippage = (
+        buy_slippage_percent
+        + sell_slippage_percent
+    )
+
+    slippage_score = max(
+        0.0,
+        25.0
+        - total_slippage * 25.0,
+    )
+
+    score = (
+        profit_score
+        + spread_score
+        + liquidity_score
+        + slippage_score
+    )
+
+    return round(
+        min(
+            100.0,
+            score,
+        ),
+        1,
+    )
+
+
+def get_quality_label(
+    score
+):
+
+    if score >= 80:
+
+        return "ОТЛИЧНАЯ ⭐⭐⭐"
+
+    if score >= 60:
+
+        return "ХОРОШАЯ ⭐⭐"
+
+    if score >= 40:
+
+        return "СРЕДНЯЯ ⭐"
+
+    return "НИЗКАЯ"
+
+
+# ============================================================
+# РАСЧЁТ АРБИТРАЖА
 # ============================================================
 
 def calculate_order_book_opportunity(
@@ -797,24 +1342,46 @@ def calculate_order_book_opportunity(
 ):
 
     # --------------------------------------------------------
-    # Сначала проверяем общую ликвидность
+    # БЫСТРАЯ ПРОВЕРКА
+    # --------------------------------------------------------
+
+    if not passes_fast_precheck(
+        buy_exchange,
+        buy_order_book,
+        sell_exchange,
+        sell_order_book,
+    ):
+
+        return None
+
+
+    # --------------------------------------------------------
+    # РЕАЛЬНЫЙ БЮДЖЕТ НА ПОКУПКУ
+    # --------------------------------------------------------
+
+    asset_budget = (
+        calculate_buy_budget()
+    )
+
+
+    # --------------------------------------------------------
+    # ЛИКВИДНОСТЬ ПОКУПКИ В ЗОНЕ ИСПОЛНЕНИЯ
     # --------------------------------------------------------
 
     required_liquidity = (
-        TRADE_AMOUNT_USD
+        asset_budget
         * LIQUIDITY_SAFETY_MULTIPLIER
     )
 
     buy_liquidity = (
-        calculate_buy_liquidity(
+        calculate_buy_execution_liquidity(
             buy_order_book["asks"]
         )
     )
 
     sell_liquidity = (
-        calculate_sell_liquidity(
-            sell_order_book["bids"],
-            buy_order_book["best_ask"],
+        calculate_sell_execution_liquidity(
+            sell_order_book["bids"]
         )
     )
 
@@ -828,12 +1395,12 @@ def calculate_order_book_opportunity(
 
 
     # --------------------------------------------------------
-    # Симулируем реальную покупку по уровням стакана
+    # ПОКУПКА ПО РЕАЛЬНОМУ СТАКАНУ
     # --------------------------------------------------------
 
     buy_result = simulate_buy(
         buy_order_book["asks"],
-        TRADE_AMOUNT_USD,
+        asset_budget,
     )
 
     if not buy_result:
@@ -842,27 +1409,43 @@ def calculate_order_book_opportunity(
 
 
     # --------------------------------------------------------
-    # Комиссия покупки
+    # КОМИССИЯ ПОКУПКИ
     # --------------------------------------------------------
 
     buy_fee_percent = (
         EXCHANGE_FEES.get(
             buy_exchange,
-            0.10,
+            0.20,
         )
     )
 
+    buy_fee_usd = (
+        buy_result["spent"]
+        * buy_fee_percent
+        / 100
+    )
+
+    buy_extra_buffer_usd = (
+        buy_result["spent"]
+        * EXTRA_COST_BUFFER_PERCENT
+        / 100
+    )
+
+    # Фактическая стоимость покупки
     buy_cost = (
         buy_result["spent"]
-        * (
-            1
-            + buy_fee_percent / 100
-        )
+        + buy_fee_usd
+        + buy_extra_buffer_usd
     )
+
+    # Защита: не превышаем заданный бюджет
+    if buy_cost > TRADE_AMOUNT_USD:
+
+        return None
 
 
     # --------------------------------------------------------
-    # Симулируем продажу того же количества монет
+    # ПРОДАЖА ТОГО ЖЕ КОЛИЧЕСТВА
     # --------------------------------------------------------
 
     sell_result = simulate_sell(
@@ -876,27 +1459,30 @@ def calculate_order_book_opportunity(
 
 
     # --------------------------------------------------------
-    # Комиссия продажи
+    # КОМИССИЯ ПРОДАЖИ
     # --------------------------------------------------------
 
     sell_fee_percent = (
         EXCHANGE_FEES.get(
             sell_exchange,
-            0.10,
+            0.20,
         )
+    )
+
+    sell_fee_usd = (
+        sell_result["revenue"]
+        * sell_fee_percent
+        / 100
     )
 
     sell_revenue = (
         sell_result["revenue"]
-        * (
-            1
-            - sell_fee_percent / 100
-        )
+        - sell_fee_usd
     )
 
 
     # --------------------------------------------------------
-    # Чистая прибыль
+    # ФАКТИЧЕСКАЯ ЧИСТАЯ ПРИБЫЛЬ
     # --------------------------------------------------------
 
     net_profit_usd = (
@@ -904,14 +1490,21 @@ def calculate_order_book_opportunity(
         - buy_cost
     )
 
+    if buy_cost <= 0:
+
+        return None
+
+    # ВАЖНО:
+    # Процент считается от фактической стоимости покупки,
+    # а не от номинальных $1000.
     net_profit_percent = (
         net_profit_usd
-        / TRADE_AMOUNT_USD
+        / buy_cost
     ) * 100
 
 
     # --------------------------------------------------------
-    # Валовый спред по фактическим средним ценам
+    # ВАЛОВЫЙ СПРЕД
     # --------------------------------------------------------
 
     gross_spread_percent = (
@@ -924,7 +1517,7 @@ def calculate_order_book_opportunity(
 
 
     # --------------------------------------------------------
-    # Проскальзывание
+    # ПРОСКАЛЬЗЫВАНИЕ
     # --------------------------------------------------------
 
     buy_slippage_percent = (
@@ -942,6 +1535,47 @@ def calculate_order_book_opportunity(
         )
         / sell_order_book["best_bid"]
     ) * 100
+
+
+    # --------------------------------------------------------
+    # ФИЛЬТР ПРОСКАЛЬЗЫВАНИЯ
+    # --------------------------------------------------------
+
+    if (
+        buy_slippage_percent
+        > MAX_BUY_SLIPPAGE_PERCENT
+    ):
+
+        return None
+
+    if (
+        sell_slippage_percent
+        > MAX_SELL_SLIPPAGE_PERCENT
+    ):
+
+        return None
+
+
+    # --------------------------------------------------------
+    # РЕЙТИНГ КАЧЕСТВА
+    # --------------------------------------------------------
+
+    quality_score = (
+        calculate_opportunity_score(
+            net_profit_percent,
+            gross_spread_percent,
+            buy_slippage_percent,
+            sell_slippage_percent,
+            buy_liquidity,
+            sell_liquidity,
+        )
+    )
+
+    quality_label = (
+        get_quality_label(
+            quality_score
+        )
+    )
 
 
     return {
@@ -1006,6 +1640,36 @@ def calculate_order_book_opportunity(
         "quantity":
             buy_result["quantity"],
 
+        "asset_budget":
+            round(
+                asset_budget,
+                2,
+            ),
+
+        "actual_buy_cost":
+            round(
+                buy_cost,
+                2,
+            ),
+
+        "buy_fee_usd":
+            round(
+                buy_fee_usd,
+                2,
+            ),
+
+        "buy_extra_buffer_usd":
+            round(
+                buy_extra_buffer_usd,
+                2,
+            ),
+
+        "sell_fee_usd":
+            round(
+                sell_fee_usd,
+                2,
+            ),
+
         "gross_spread_percent":
             round(
                 gross_spread_percent,
@@ -1041,6 +1705,22 @@ def calculate_order_book_opportunity(
                 sell_slippage_percent,
                 4,
             ),
+
+        "quality_score":
+            quality_score,
+
+        "quality_label":
+            quality_label,
+
+        "buy_order_book_age":
+            buy_order_book[
+                "timestamp_age"
+            ],
+
+        "sell_order_book_age":
+            sell_order_book[
+                "timestamp_age"
+            ],
     }
 
 
@@ -1052,8 +1732,6 @@ def scan_symbol(
     symbol
 ):
 
-    # Параллельно получаем стаканы
-    # со всех доступных бирж
     order_books = (
         get_all_order_books_parallel(
             symbol
@@ -1066,71 +1744,130 @@ def scan_symbol(
         order_books.keys()
     )
 
+    if len(exchange_ids) < 2:
+
+        return opportunities
+
+
+    # --------------------------------------------------------
+    # СОЗДАЁМ ТОЛЬКО ПЕРСПЕКТИВНЫЕ ПАРЫ
+    # --------------------------------------------------------
+
+    candidate_pairs = []
+
     for buy_exchange in exchange_ids:
+
+        buy_book = order_books[
+            buy_exchange
+        ]
 
         for sell_exchange in exchange_ids:
 
             if buy_exchange == sell_exchange:
+
                 continue
 
-            buy_order_book = (
-                order_books[
+            sell_book = order_books[
+                sell_exchange
+            ]
+
+            if not passes_fast_precheck(
+                buy_exchange,
+                buy_book,
+                sell_exchange,
+                sell_book,
+            ):
+
+                continue
+
+            candidate_pairs.append(
+                (
+                    buy_exchange,
+                    sell_exchange,
+                )
+            )
+
+
+    # --------------------------------------------------------
+    # ПОЛНЫЙ РАСЧЁТ ТОЛЬКО КАНДИДАТОВ
+    # --------------------------------------------------------
+
+    for (
+        buy_exchange,
+        sell_exchange,
+    ) in candidate_pairs:
+
+        opportunity = (
+            calculate_order_book_opportunity(
+                symbol=symbol,
+                buy_exchange=buy_exchange,
+                buy_order_book=order_books[
                     buy_exchange
-                ]
-            )
-
-            sell_order_book = (
-                order_books[
+                ],
+                sell_exchange=sell_exchange,
+                sell_order_book=order_books[
                     sell_exchange
-                ]
+                ],
             )
+        )
 
+        if not opportunity:
 
-            # Быстрая предварительная проверка
-            if (
-                sell_order_book["best_bid"]
-                <= buy_order_book["best_ask"]
-            ):
+            continue
 
-                continue
+        if (
+            opportunity[
+                "net_profit_percent"
+            ]
+            >= MIN_NET_PROFIT_PERCENT
+        ):
 
-
-            opportunity = (
-                calculate_order_book_opportunity(
-                    symbol=symbol,
-                    buy_exchange=buy_exchange,
-                    buy_order_book=buy_order_book,
-                    sell_exchange=sell_exchange,
-                    sell_order_book=sell_order_book,
-                )
+            opportunities.append(
+                opportunity
             )
-
-            if not opportunity:
-                continue
-
-
-            if (
-                opportunity[
-                    "net_profit_percent"
-                ]
-                >= MIN_NET_PROFIT_PERCENT
-            ):
-
-                opportunities.append(
-                    opportunity
-                )
 
     return opportunities
 
 
 # ============================================================
-# ПОЛНОЕ СКАНИРОВАНИЕ
+# СКАНИРОВАНИЕ ОДНОЙ МОНЕТЫ В ПОТОКЕ
+# ============================================================
+
+def scan_symbol_worker(
+    symbol
+):
+
+    with lock:
+
+        if symbol not in current_symbols:
+
+            current_symbols.append(
+                symbol
+            )
+
+    try:
+
+        return scan_symbol(
+            symbol
+        )
+
+    finally:
+
+        with lock:
+
+            if symbol in current_symbols:
+
+                current_symbols.remove(
+                    symbol
+                )
+
+
+# ============================================================
+# ПОЛНОЕ ПАРАЛЛЕЛЬНОЕ СКАНИРОВАНИЕ
 # ============================================================
 
 def scan_all():
 
-    global current_symbol
-    global current_symbol_index
     global current_scan_total
 
     all_opportunities = []
@@ -1139,32 +1876,38 @@ def scan_all():
         SYMBOLS
     )
 
-    for index, symbol in enumerate(
-        SYMBOLS,
-        start=1,
+    # Используем постоянный общий пул.
+    # Монеты запускаются параллельно.
+    futures = {}
+
+    for symbol in SYMBOLS:
+
+        future = executor.submit(
+            scan_symbol_worker,
+            symbol,
+        )
+
+        futures[
+            future
+        ] = symbol
+
+    for future in as_completed(
+        futures
     ):
 
-        with lock:
-
-            current_symbol = symbol
-
-            current_symbol_index = index
-
-        print(
-            f"🔍 Монета "
-            f"{index}/{len(SYMBOLS)}: "
-            f"{symbol}"
-        )
+        symbol = futures[
+            future
+        ]
 
         try:
 
-            opportunities = scan_symbol(
-                symbol
-            )
+            opportunities = future.result()
 
-            all_opportunities.extend(
-                opportunities
-            )
+            if opportunities:
+
+                all_opportunities.extend(
+                    opportunities
+                )
 
         except Exception as e:
 
@@ -1173,21 +1916,78 @@ def scan_all():
                 f"{symbol}: {e}"
             )
 
-    with lock:
-
-        current_symbol = None
-
-        current_symbol_index = len(
-            SYMBOLS
-        )
-
+    # Сначала лучшие по рейтингу,
+    # затем по чистой прибыли.
     all_opportunities.sort(
-        key=lambda x:
+        key=lambda x: (
+            x["quality_score"],
             x["net_profit_percent"],
+        ),
         reverse=True,
     )
 
     return all_opportunities
+
+
+# ============================================================
+# АВТОМАТИЧЕСКАЯ ОЧИСТКА СТАРЫХ ДАННЫХ
+# ============================================================
+
+def cleanup_old_data():
+
+    current_time = time.time()
+
+    with pending_lock:
+
+        expired_ids = [
+
+            opportunity_id
+
+            for (
+                opportunity_id,
+                opportunity,
+            ) in pending_opportunities.items()
+
+            if (
+                current_time
+                - opportunity[
+                    "created_at"
+                ]
+                > OPPORTUNITY_TTL
+            )
+        ]
+
+        for opportunity_id in expired_ids:
+
+            pending_opportunities.pop(
+                opportunity_id,
+                None,
+            )
+
+    with notification_lock:
+
+        old_keys = [
+
+            key
+
+            for (
+                key,
+                last_sent,
+            ) in last_sent_notifications.items()
+
+            if (
+                current_time
+                - last_sent
+                > NOTIFICATION_COOLDOWN * 2
+            )
+        ]
+
+        for key in old_keys:
+
+            last_sent_notifications.pop(
+                key,
+                None,
+            )
 
 
 # ============================================================
@@ -1206,92 +2006,122 @@ def send_opportunity_to_telegram(
 
     current_time = time.time()
 
-    last_sent = (
-        last_sent_notifications.get(
-            notification_key,
-            0,
+    with notification_lock:
+
+        last_sent = (
+            last_sent_notifications.get(
+                notification_key,
+                0,
+            )
         )
-    )
 
-    if (
-        current_time - last_sent
-        < NOTIFICATION_COOLDOWN
-    ):
+        if (
+            current_time
+            - last_sent
+            < NOTIFICATION_COOLDOWN
+        ):
 
-        return False
+            return False
+
 
     opportunity_id = str(
         uuid.uuid4()
     )[:8]
 
-    pending_opportunities[
-        opportunity_id
-    ] = {
 
-        "id":
-            opportunity_id,
+    # Сохраняем возможность потокобезопасно
+    with pending_lock:
 
-        "symbol":
-            opportunity["symbol"],
+        pending_opportunities[
+            opportunity_id
+        ] = {
 
-        "buy_exchange":
-            opportunity["buy_exchange"],
+            "id":
+                opportunity_id,
 
-        "sell_exchange":
-            opportunity["sell_exchange"],
+            "symbol":
+                opportunity["symbol"],
 
-        "created_at":
-            current_time,
-    }
+            "buy_exchange":
+                opportunity["buy_exchange"],
+
+            "sell_exchange":
+                opportunity["sell_exchange"],
+
+            "created_at":
+                current_time,
+        }
+
 
     text = f"""
 🚨 <b>АРБИТРАЖНАЯ ВОЗМОЖНОСТЬ</b>
 
 🪙 <b>{opportunity['symbol']}</b>
 
-🟢 <b>КУПИТЬ</b>
-<b>{opportunity['buy_exchange_name']}</b>
+⭐ <b>Качество: {opportunity['quality_score']}/100</b>
+{opportunity['quality_label']}
 
-💵 Средняя цена по стакану:
+━━━━━━━━━━━━━━━━━━
+
+🟢 <b>КУПИТЬ</b>
+
+🏦 <b>{opportunity['buy_exchange_name']}</b>
+
+💵 Средняя цена:
 <b>${opportunity['buy_price']}</b>
 
-📚 Ликвидность стакана:
-<b>${opportunity['buy_exchange_liquidity']}</b>
+📚 Ликвидность в зоне исполнения:
+<b>${opportunity['buy_exchange_liquidity']:,.2f}</b>
 
+📉 Проскальзывание:
+<b>{opportunity['buy_slippage_percent']}%</b>
+
+━━━━━━━━━━━━━━━━━━
 
 🔴 <b>ПРОДАТЬ</b>
-<b>{opportunity['sell_exchange_name']}</b>
 
-💵 Средняя цена по стакану:
+🏦 <b>{opportunity['sell_exchange_name']}</b>
+
+💵 Средняя цена:
 <b>${opportunity['sell_price']}</b>
 
-📚 Ликвидность стакана:
-<b>${opportunity['sell_exchange_liquidity']}</b>
+📚 Ликвидность в зоне исполнения:
+<b>${opportunity['sell_exchange_liquidity']:,.2f}</b>
 
+📉 Проскальзывание:
+<b>{opportunity['sell_slippage_percent']}%</b>
+
+━━━━━━━━━━━━━━━━━━
 
 📊 Валовый спред:
 <b>+{opportunity['gross_spread_percent']}%</b>
 
-📉 Проскальзывание покупки:
-<b>{opportunity['buy_slippage_percent']}%</b>
+💰 Фактическая стоимость покупки:
+<b>${opportunity['actual_buy_cost']:,.2f}</b>
 
-📉 Проскальзывание продажи:
-<b>{opportunity['sell_slippage_percent']}%</b>
+💸 Комиссия покупки:
+<b>${opportunity['buy_fee_usd']:,.2f}</b>
 
-📈 <b>Чистая прибыль после комиссий:</b>
+💸 Комиссия продажи:
+<b>${opportunity['sell_fee_usd']:,.2f}</b>
+
+📈 <b>ЧИСТАЯ ПРИБЫЛЬ:</b>
 <b>+{opportunity['net_profit_percent']}%</b>
 
-💰 Размер сделки:
-<b>${TRADE_AMOUNT_USD}</b>
-
 💵 Ожидаемая прибыль:
-<b>+${opportunity['net_profit_usd']}</b>
+<b>+${opportunity['net_profit_usd']:,.2f}</b>
+
+━━━━━━━━━━━━━━━━━━
 
 🔁 <b>ДВОЙНАЯ ПРОВЕРКА ВКЛЮЧЕНА</b>
 
-После нажатия «ДА» бот ещё раз
-параллельно проверит стаканы,
-ликвидность и актуальную прибыль.
+После нажатия «ДА» бот повторно
+получит свежие стаканы с обеих бирж,
+заново рассчитает ликвидность,
+исполнение, комиссии и прибыль.
+
+🧪 <b>ТЕСТОВЫЙ РЕЖИМ</b>
+Реальные ордера не выставляются.
 """
 
     reply_markup = {
@@ -1323,29 +2153,32 @@ def send_opportunity_to_telegram(
         reply_markup,
     )
 
-    if (
-        result
-        and result.get("ok")
-    ):
+    if result and result.get("ok"):
 
-        last_sent_notifications[
-            notification_key
-        ] = current_time
+        with notification_lock:
+
+            last_sent_notifications[
+                notification_key
+            ] = current_time
 
         print(
-            f"📨 Telegram отправлен: "
+            f"📨 Telegram: "
             f"{opportunity['symbol']} "
             f"{opportunity['buy_exchange']} → "
             f"{opportunity['sell_exchange']} "
-            f"+{opportunity['net_profit_percent']}%"
+            f"+{opportunity['net_profit_percent']}% "
+            f"Score {opportunity['quality_score']}"
         )
 
         return True
 
-    pending_opportunities.pop(
-        opportunity_id,
-        None,
-    )
+
+    with pending_lock:
+
+        pending_opportunities.pop(
+            opportunity_id,
+            None,
+        )
 
     return False
 
@@ -1358,101 +2191,97 @@ def recheck_opportunity(
     opportunity_id
 ):
 
-    opportunity = pending_opportunities.get(
-        opportunity_id
-    )
+    with pending_lock:
 
-    if not opportunity:
-
-        return (
-            None,
-            "Возможность уже устарела.",
-        )
-
-    if (
-        time.time()
-        - opportunity["created_at"]
-        > OPPORTUNITY_TTL
-    ):
-
-        pending_opportunities.pop(
-            opportunity_id,
-            None,
-        )
-
-        return (
-            None,
-            "Возможность устарела.",
-        )
-
-    symbol = opportunity["symbol"]
-
-    buy_exchange = (
-        opportunity["buy_exchange"]
-    )
-
-    sell_exchange = (
-        opportunity["sell_exchange"]
-    )
-
-
-    # --------------------------------------------------------
-    # ДВОЙНАЯ ПАРАЛЛЕЛЬНАЯ ПРОВЕРКА
-    # --------------------------------------------------------
-
-    with ThreadPoolExecutor(
-        max_workers=2
-    ) as executor:
-
-        buy_future = executor.submit(
-            get_order_book,
-            buy_exchange,
-            symbol,
-        )
-
-        sell_future = executor.submit(
-            get_order_book,
-            sell_exchange,
-            symbol,
-        )
-
-        try:
-
-            buy_order_book = (
-                buy_future.result()
+        opportunity = (
+            pending_opportunities.get(
+                opportunity_id
             )
+        )
 
-            sell_order_book = (
-                sell_future.result()
-            )
-
-        except Exception as e:
+        if not opportunity:
 
             return (
                 None,
-                f"Ошибка повторной проверки: {e}",
+                "Возможность уже устарела.",
             )
+
+        if (
+            time.time()
+            - opportunity["created_at"]
+            > OPPORTUNITY_TTL
+        ):
+
+            pending_opportunities.pop(
+                opportunity_id,
+                None,
+            )
+
+            return (
+                None,
+                "Возможность устарела.",
+            )
+
+        symbol = opportunity["symbol"]
+
+        buy_exchange = (
+            opportunity["buy_exchange"]
+        )
+
+        sell_exchange = (
+            opportunity["sell_exchange"]
+        )
+
+
+    # ВАЖНО:
+    # Не создаём новый ThreadPoolExecutor.
+    # Используем постоянный общий пул.
+    buy_future = executor.submit(
+        get_order_book,
+        buy_exchange,
+        symbol,
+    )
+
+    sell_future = executor.submit(
+        get_order_book,
+        sell_exchange,
+        symbol,
+    )
+
+    try:
+
+        buy_order_book = (
+            buy_future.result()
+        )
+
+        sell_order_book = (
+            sell_future.result()
+        )
+
+    except Exception as e:
+
+        return (
+            None,
+            f"Ошибка повторной проверки: {e}",
+        )
 
     if not buy_order_book:
 
         return (
             None,
-            f"Не удалось получить "
-            f"актуальный стакан "
-            f"{buy_exchange}.",
+            f"Не удалось получить свежий "
+            f"стакан {buy_exchange}.",
         )
 
     if not sell_order_book:
 
         return (
             None,
-            f"Не удалось получить "
-            f"актуальный стакан "
-            f"{sell_exchange}.",
+            f"Не удалось получить свежий "
+            f"стакан {sell_exchange}.",
         )
 
 
-    # Проверяем реальную возможность
     current_opportunity = (
         calculate_order_book_opportunity(
             symbol=symbol,
@@ -1468,9 +2297,25 @@ def recheck_opportunity(
         return (
             None,
             "После повторной проверки "
-            "недостаточно ликвидности "
-            "или сделка не может быть "
-            "полностью исполнена по стакану.",
+            "возможность больше не соответствует "
+            "требованиям по прибыли, ликвидности "
+            "или проскальзыванию.",
+        )
+
+    if (
+        current_opportunity[
+            "net_profit_percent"
+        ]
+        < MIN_NET_PROFIT_PERCENT
+    ):
+
+        return (
+            None,
+            f"После повторной проверки "
+            f"чистая прибыль "
+            f"{current_opportunity['net_profit_percent']}%, "
+            f"что ниже требуемых "
+            f"{MIN_NET_PROFIT_PERCENT}%.",
         )
 
     return (
@@ -1511,7 +2356,6 @@ def handle_callback(
         )
     )
 
-    # Только владелец может управлять ботом
     if chat_id != TELEGRAM_CHAT_ID:
 
         answer_callback_query(
@@ -1538,42 +2382,45 @@ def handle_callback(
     )
 
 
-    # ========================================================
+    # --------------------------------------------------------
     # НЕТ
-    # ========================================================
+    # --------------------------------------------------------
 
     if action == "no":
 
-        pending_opportunities.pop(
-            opportunity_id,
-            None,
-        )
+        with pending_lock:
+
+            pending_opportunities.pop(
+                opportunity_id,
+                None,
+            )
 
         answer_callback_query(
             callback_id,
-            "Сделка отменена.",
+            "Сделка отклонена.",
         )
 
         send_telegram_message(
             """
-❌ <b>СДЕЛКА ОТКЛОНЕНА</b>
+❌ <b>ВОЗМОЖНОСТЬ ОТКЛОНЕНА</b>
 
-Никаких действий выполнено не было.
+Никаких реальных ордеров
+не выставлялось.
 """
         )
 
         return
 
 
-    # ========================================================
-    # ДА — ПОВТОРНАЯ ПРОВЕРКА
-    # ========================================================
+    # --------------------------------------------------------
+    # ДА
+    # --------------------------------------------------------
 
     if action == "yes":
 
         answer_callback_query(
             callback_id,
-            "Параллельно проверяю стаканы...",
+            "Повторно проверяю свежие стаканы...",
         )
 
         current, error = (
@@ -1582,64 +2429,28 @@ def handle_callback(
             )
         )
 
-        pending_opportunities.pop(
-            opportunity_id,
-            None,
-        )
+        with pending_lock:
+
+            pending_opportunities.pop(
+                opportunity_id,
+                None,
+            )
 
         if error:
 
             send_telegram_message(
                 f"""
-⚠️ <b>СДЕЛКА НЕ ПОДТВЕРЖДЕНА</b>
+⚠️ <b>ВОЗМОЖНОСТЬ НЕ ПОДТВЕРЖДЕНА</b>
 
 {error}
 
-Никаких реальных ордеров
-выставлено не было.
+🧪 Реальные ордера
+<b>НЕ выставлялись.</b>
 """
             )
 
             return
 
-
-        # ----------------------------------------------------
-        # Финальная проверка минимальной прибыли
-        # ----------------------------------------------------
-
-        if (
-            current[
-                "net_profit_percent"
-            ]
-            < MIN_NET_PROFIT_PERCENT
-        ):
-
-            send_telegram_message(
-                f"""
-⚠️ <b>СДЕЛКА ОТМЕНЕНА</b>
-
-После повторной проверки
-цены изменились.
-
-🪙 <b>{current['symbol']}</b>
-
-📈 Новая чистая прибыль:
-<b>{current['net_profit_percent']}%</b>
-
-❌ Требуемый минимум:
-<b>{MIN_NET_PROFIT_PERCENT}%</b>
-
-Никаких реальных ордеров
-выставлено не было.
-"""
-            )
-
-            return
-
-
-        # ----------------------------------------------------
-        # ВОЗМОЖНОСТЬ ПОДТВЕРЖДЕНА
-        # ----------------------------------------------------
 
         send_telegram_message(
             f"""
@@ -1647,55 +2458,63 @@ def handle_callback(
 
 🪙 <b>{current['symbol']}</b>
 
+⭐ Качество:
+<b>{current['quality_score']}/100</b>
+
+{current['quality_label']}
+
+━━━━━━━━━━━━━━━━━━
 
 🟢 Купить:
 <b>{current['buy_exchange_name']}</b>
 
-💵 Средняя цена исполнения:
+Средняя цена:
 <b>${current['buy_price']}</b>
 
-📚 Ликвидность:
-<b>${current['buy_exchange_liquidity']}</b>
+Ликвидность:
+<b>${current['buy_exchange_liquidity']:,.2f}</b>
 
+Проскальзывание:
+<b>{current['buy_slippage_percent']}%</b>
+
+━━━━━━━━━━━━━━━━━━
 
 🔴 Продать:
 <b>{current['sell_exchange_name']}</b>
 
-💵 Средняя цена исполнения:
+Средняя цена:
 <b>${current['sell_price']}</b>
 
-📚 Ликвидность:
-<b>${current['sell_exchange_liquidity']}</b>
+Ликвидность:
+<b>${current['sell_exchange_liquidity']:,.2f}</b>
 
+Проскальзывание:
+<b>{current['sell_slippage_percent']}%</b>
+
+━━━━━━━━━━━━━━━━━━
+
+💰 Фактическая стоимость покупки:
+<b>${current['actual_buy_cost']:,.2f}</b>
 
 📊 Валовый спред:
 <b>+{current['gross_spread_percent']}%</b>
 
-📉 Проскальзывание покупки:
-<b>{current['buy_slippage_percent']}%</b>
-
-📉 Проскальзывание продажи:
-<b>{current['sell_slippage_percent']}%</b>
-
-
 📈 <b>АКТУАЛЬНАЯ ЧИСТАЯ ПРИБЫЛЬ:</b>
 <b>+{current['net_profit_percent']}%</b>
 
-💵 Ожидаемый результат:
-<b>+${current['net_profit_usd']}</b>
+💵 Ожидаемая прибыль:
+<b>+${current['net_profit_usd']:,.2f}</b>
 
+━━━━━━━━━━━━━━━━━━
 
 🧪 <b>ТЕСТОВЫЙ РЕЖИМ</b>
 
-Проверка цен, стакана и ликвидности
-успешно пройдена.
+Повторная проверка успешно пройдена.
 
-Реальные ордера пока
+Реальные ордера
 <b>НЕ выставляются.</b>
 """
         )
-
-        return
 
 
 # ============================================================
@@ -1703,8 +2522,6 @@ def handle_callback(
 # ============================================================
 
 def telegram_polling():
-
-    global telegram_started
 
     print(
         "🤖 Telegram polling запущен."
@@ -1717,7 +2534,8 @@ def telegram_polling():
         try:
 
             request_data = {
-                "timeout": 20,
+                "timeout":
+                    TELEGRAM_LONG_POLL_TIMEOUT,
             }
 
             if offset is not None:
@@ -1771,11 +2589,33 @@ def telegram_polling():
         except Exception as e:
 
             print(
-                f"⚠️ Ошибка Telegram "
-                f"polling: {e}"
+                f"⚠️ Telegram polling: {e}"
             )
 
             time.sleep(5)
+
+
+# ============================================================
+# ФОНОВАЯ ОЧИСТКА
+# ============================================================
+
+def cleanup_loop():
+
+    while True:
+
+        try:
+
+            cleanup_old_data()
+
+        except Exception as e:
+
+            print(
+                f"⚠️ Ошибка очистки: {e}"
+            )
+
+        time.sleep(
+            CLEANUP_INTERVAL
+        )
 
 
 # ============================================================
@@ -1795,28 +2635,31 @@ def scanner_loop():
 
     while True:
 
+        scan_started = time.time()
+
         try:
 
             print("")
+            print(
+                "=========================================="
+            )
 
             print(
-                f"🔄 НАЧАЛО СКАНИРОВАНИЯ "
+                f"🔄 СКАНИРОВАНИЕ "
                 f"{datetime.now().strftime('%H:%M:%S')}"
             )
 
             print(
-                f"🪙 Монет для проверки: "
-                f"{len(SYMBOLS)}"
+                f"🪙 Монет: {len(SYMBOLS)}"
             )
 
             print(
-                f"🏦 Подключено бирж: "
-                f"{len(exchanges)}"
+                f"🏦 Бирж: {len(exchanges)}"
             )
 
             print(
-                "⚡ Стаканы получаются "
-                "параллельно"
+                "⚡ Монеты и стаканы "
+                "получаются параллельно"
             )
 
             opportunities = scan_all()
@@ -1837,9 +2680,19 @@ def scanner_loop():
                     len(opportunities)
                 )
 
+            scan_duration = (
+                time.time()
+                - scan_started
+            )
+
             print(
-                f"📊 Найдено возможностей: "
+                f"📊 Возможностей: "
                 f"{len(opportunities)}"
+            )
+
+            print(
+                f"⏱ Длительность: "
+                f"{scan_duration:.2f} сек."
             )
 
             sent_count = 0
@@ -1853,19 +2706,19 @@ def scanner_loop():
 
                     break
 
-                sent = (
-                    send_opportunity_to_telegram(
-                        opportunity
-                    )
-                )
-
-                if sent:
+                if send_opportunity_to_telegram(
+                    opportunity
+                ):
 
                     sent_count += 1
 
             print(
-                f"📨 Отправлено уведомлений: "
+                f"📨 Отправлено: "
                 f"{sent_count}"
+            )
+
+            print(
+                "=========================================="
             )
 
         except Exception as e:
@@ -1875,8 +2728,19 @@ def scanner_loop():
                 f"сканера: {e}"
             )
 
-        time.sleep(
+        elapsed = (
+            time.time()
+            - scan_started
+        )
+
+        sleep_time = max(
+            1,
             SCAN_INTERVAL
+            - elapsed,
+        )
+
+        time.sleep(
+            sleep_time
         )
 
 
@@ -1893,6 +2757,7 @@ def start_background_services():
     with startup_lock:
 
         if services_started:
+
             return
 
         services_started = True
@@ -1909,13 +2774,8 @@ def start_background_services():
         )
 
         print(
-            f"🪙 Всего монет: "
-            f"{len(SYMBOLS)}"
-        )
-
-        print(
-            f"🏦 Всего бирж: "
-            f"{len(exchanges)}"
+            f"💰 Размер сделки: "
+            f"${TRADE_AMOUNT_USD:,.2f}"
         )
 
         print(
@@ -1924,18 +2784,27 @@ def start_background_services():
         )
 
         print(
-            "📚 Проверка стакана "
-            "и ликвидности: ВКЛ"
+            f"🪙 Монет: "
+            f"{len(SYMBOLS)}"
         )
 
         print(
-            "⚡ Параллельные запросы: ВКЛ"
+            f"🏦 Бирж: "
+            f"{len(exchanges)}"
         )
 
+        print(
+            f"⚡ Постоянный пул: "
+            f"{MAX_WORKERS} потоков"
+        )
+
+        # Markets загружаются только один раз
+        load_all_markets()
+
+        # Telegram
         telegram_ok = (
             check_telegram_connection()
         )
-
 
         if telegram_ok:
 
@@ -1958,7 +2827,18 @@ def start_background_services():
                 "не запущен."
             )
 
+        # Очистка старых данных
+        cleanup_thread = (
+            threading.Thread(
+                target=cleanup_loop,
+                daemon=True,
+                name="cleanup-service",
+            )
+        )
 
+        cleanup_thread.start()
+
+        # Сканер
         scanner_thread = (
             threading.Thread(
                 target=scanner_loop,
@@ -1972,14 +2852,12 @@ def start_background_services():
         scanner_started = True
 
         print(
-            "✅ Фоновые сервисы запущены."
+            "✅ Все фоновые сервисы запущены."
         )
 
         print(
             "=========================================="
         )
-
-        print("")
 
 
 # ============================================================
@@ -2012,27 +2890,26 @@ body {
 }
 
 .container {
-    max-width: 900px;
+    max-width: 1000px;
     margin: auto;
 }
 
 .status {
     display: inline-block;
     background: #124d3d;
-    color: #7de0bb;
     padding: 18px 28px;
     border-radius: 40px;
     font-size: 20px;
     margin-bottom: 20px;
 }
 
-.card {
+.card,
+.opportunity {
     background: #1d2939;
     border: 1px solid #31445f;
     border-radius: 25px;
     padding: 25px;
-    margin-bottom: 18px;
-    font-size: 20px;
+    margin-bottom: 20px;
 }
 
 .stats-grid {
@@ -2040,7 +2917,7 @@ body {
     grid-template-columns:
         repeat(
             auto-fit,
-            minmax(180px, 1fr)
+            minmax(170px, 1fr)
         );
     gap: 15px;
     margin-bottom: 20px;
@@ -2049,87 +2926,55 @@ body {
 .stat-box {
     background: #1d2939;
     border: 1px solid #31445f;
-    border-radius: 25px;
-    padding: 22px;
+    border-radius: 20px;
+    padding: 20px;
 }
 
 .stat-number {
-    font-size: 38px;
+    font-size: 30px;
     font-weight: bold;
-    color: #66aaff;
 }
 
 .stat-label {
-    color: #b8c2d2;
     margin-top: 8px;
-    font-size: 17px;
-}
-
-.scanning {
-    background: #27395b;
-    border-radius: 20px;
-    padding: 20px;
-    margin-bottom: 20px;
-    font-size: 20px;
-}
-
-.opportunity {
-    background: #1d2939;
-    border: 1px solid #31445f;
-    border-radius: 28px;
-    padding: 28px;
-    margin-bottom: 20px;
+    color: #b8c2d2;
 }
 
 .symbol {
-    font-size: 38px;
+    font-size: 30px;
     font-weight: bold;
-    margin-bottom: 20px;
-}
-
-.profit {
-    background: #922321;
-    padding: 22px;
-    border-radius: 28px;
-    font-size: 22px;
-    margin-bottom: 20px;
-}
-
-.buy {
-    background: #34446b;
-    padding: 22px;
-    border-radius: 25px;
     margin-bottom: 15px;
 }
 
+.profit {
+    padding: 20px;
+    border-radius: 20px;
+    background: #27395b;
+    margin-bottom: 15px;
+}
+
+.buy,
 .sell {
-    background: #542c3a;
-    padding: 22px;
-    border-radius: 25px;
+    padding: 20px;
+    border-radius: 20px;
+    margin-top: 12px;
+    background: #223047;
 }
 
 .exchange {
-    font-size: 27px;
-    font-weight: bold;
-    margin-top: 8px;
-}
-
-.price {
     font-size: 24px;
-    margin-top: 10px;
+    font-weight: bold;
+    margin: 10px 0;
 }
 
 .small-info {
-    margin-top: 12px;
+    margin-top: 8px;
     color: #b8c2d2;
-    font-size: 17px;
 }
 
 .empty {
     text-align: center;
-    padding: 40px 20px;
-    color: #b8c2d2;
-    font-size: 20px;
+    padding: 40px;
 }
 
 </style>
@@ -2139,7 +2984,6 @@ body {
 <body>
 
 <div class="container">
-
 
 <div class="status">
 🟢 Арбитражный сканер активен
@@ -2155,7 +2999,7 @@ body {
 </div>
 
 <div class="stat-label">
-🪙 Всего монет
+🪙 Монеты
 </div>
 
 </div>
@@ -2168,20 +3012,7 @@ body {
 </div>
 
 <div class="stat-label">
-🏦 Бирж подключено
-</div>
-
-</div>
-
-
-<div class="stat-box">
-
-<div class="stat-number">
-{{ current_index }}/{{ total_coins }}
-</div>
-
-<div class="stat-label">
-🔍 Прогресс сканирования
+🏦 Биржи
 </div>
 
 </div>
@@ -2194,52 +3025,41 @@ body {
 </div>
 
 <div class="stat-label">
-📈 Возможностей найдено
+📈 Возможности
 </div>
 
 </div>
 
+
+<div class="stat-box">
+
+<div class="stat-number">
+{{ total_scans }}
 </div>
 
+<div class="stat-label">
+🔄 Всего сканов
+</div>
 
-<div class="scanning">
-
-{% if current_symbol %}
-
-🔍 Сейчас сканируется:
-
-<b>{{ current_symbol }}</b>
-
-<br><br>
-
-📊 Монета
-<b>{{ current_index }}</b>
-из
-<b>{{ total_coins }}</b>
-
-{% else %}
-
-⏳ Ожидание следующего сканирования
-
-<br><br>
-
-⚡ Данные со всех бирж
-получаются параллельно.
-
-{% endif %}
+</div>
 
 </div>
 
 
 <div class="card">
 
-🎯 Минимальная чистая прибыль:
+💰 Размер сделки:
+<b>${{ "%.2f"|format(trade_amount) }}</b>
+
+<br><br>
+
+📈 Минимальная чистая прибыль:
 <b>{{ min_profit }}%</b>
 
 <br><br>
 
-💸 Размер сделки:
-<b>${{ trade_amount }}</b>
+⚡ Постоянный пул потоков:
+<b>ВКЛЮЧЕН</b>
 
 <br><br>
 
@@ -2248,13 +3068,13 @@ body {
 
 <br><br>
 
-💧 Запас ликвидности:
-<b>20%</b>
+💧 Ликвидность в зоне исполнения:
+<b>ВКЛЮЧЕНА</b>
 
 <br><br>
 
-⚡ Параллельные запросы:
-<b>ВКЛЮЧЕНЫ</b>
+🕒 Свежесть стакана:
+<b>ВКЛЮЧЕНА</b>
 
 <br><br>
 
@@ -2263,40 +3083,32 @@ body {
 
 <br><br>
 
-🔄 Новый скан каждые:
-<b>{{ interval }} секунд</b>
+⭐ Рейтинг качества:
+<b>ВКЛЮЧЕН</b>
 
 <br><br>
 
-🏦 Задействовано бирж:
-<b>{{ exchanges_count }}</b>
-
-<br><br>
-
-🪙 Общее количество монет:
-<b>{{ total_coins }}</b>
-
-<br><br>
-
-🤖 Telegram:
-<b>{{ telegram_status }}</b>
-
-<br><br>
-
-🔄 Всего выполнено сканов:
-<b>{{ total_scans }}</b>
-
-<br><br>
-
-📊 Всего найдено возможностей:
-<b>{{ total_found }}</b>
-
-<br><br>
-
-🕒 Последний скан:
-{{ last_scan }}
+🧪 Режим:
+<b>ТЕСТОВЫЙ</b>
 
 </div>
+
+
+{% if current_symbols %}
+
+<div class="card">
+
+🔍 Сейчас параллельно сканируются:
+
+<br><br>
+
+<b>
+{{ current_symbols|join(", ") }}
+</b>
+
+</div>
+
+{% endif %}
 
 
 {% if opportunities %}
@@ -2309,23 +3121,24 @@ body {
 🪙 {{ op.symbol }}
 </div>
 
-
 <div class="profit">
 
-<b>
+⭐ Качество:
+<b>{{ op.quality_score }}/100</b>
+
+<br><br>
+
+<b>{{ op.quality_label }}</b>
+
+<br><br>
+
 📈 Чистая прибыль:
-+{{ op.net_profit_percent }}%
-</b>
+<b>+{{ op.net_profit_percent }}%</b>
 
 <br><br>
 
-📊 Валовый спред:
-+{{ op.gross_spread_percent }}%
-
-<br><br>
-
-💰 Результат на ${{ trade_amount }}:
-<b>${{ op.net_profit_usd }}</b>
+💵 Прибыль:
+<b>+${{ op.net_profit_usd }}</b>
 
 </div>
 
@@ -2338,20 +3151,17 @@ body {
 {{ op.buy_exchange_name }}
 </div>
 
-<div class="price">
-Средняя цена: ${{ op.buy_price }}
+Средняя цена:
+<b>${{ op.buy_price }}</b>
+
+<div class="small-info">
+Ликвидность:
+${{ op.buy_exchange_liquidity }}
 </div>
 
 <div class="small-info">
-Лучший Ask: ${{ op.buy_best_ask }}
-</div>
-
-<div class="small-info">
-Ликвидность: ${{ op.buy_exchange_liquidity }}
-</div>
-
-<div class="small-info">
-Проскальзывание: {{ op.buy_slippage_percent }}%
+Проскальзывание:
+{{ op.buy_slippage_percent }}%
 </div>
 
 </div>
@@ -2365,20 +3175,17 @@ body {
 {{ op.sell_exchange_name }}
 </div>
 
-<div class="price">
-Средняя цена: ${{ op.sell_price }}
+Средняя цена:
+<b>${{ op.sell_price }}</b>
+
+<div class="small-info">
+Ликвидность:
+${{ op.sell_exchange_liquidity }}
 </div>
 
 <div class="small-info">
-Лучший Bid: ${{ op.sell_best_bid }}
-</div>
-
-<div class="small-info">
-Ликвидность: ${{ op.sell_exchange_liquidity }}
-</div>
-
-<div class="small-info">
-Проскальзывание: {{ op.sell_slippage_percent }}%
+Проскальзывание:
+{{ op.sell_slippage_percent }}%
 </div>
 
 </div>
@@ -2391,24 +3198,17 @@ body {
 
 <div class="card empty">
 
-🔎 Пока подходящих возможностей нет.
+🔎 Подходящих возможностей пока нет.
 
 <br><br>
 
-Бот продолжает искать среди
-<b>{{ total_coins }}</b> монет
-на <b>{{ exchanges_count }}</b> биржах.
-
-<br><br>
-
-Проверяются реальные стаканы,
-ликвидность, комиссии
-и проскальзывание.
+Бот проверяет реальные стаканы,
+ликвидность, комиссии,
+проскальзывание и свежесть данных.
 
 </div>
 
 {% endif %}
-
 
 </div>
 
@@ -2419,7 +3219,7 @@ setTimeout(
     () => {
         location.reload();
     },
-    {{ interval * 1000 }}
+    5000
 );
 
 </script>
@@ -2444,18 +3244,10 @@ def index():
             last_opportunities
         )
 
-        scan_time = last_scan_time
-
-        current = current_symbol
-
-        current_index = (
-            current_symbol_index
-        )
-
         scans = total_scans
 
-        found = (
-            total_opportunities_found
+        current = list(
+            current_symbols
         )
 
     return render_template_string(
@@ -2464,20 +3256,11 @@ def index():
 
         opportunities=opportunities,
 
-        min_profit=
-            MIN_NET_PROFIT_PERCENT,
-
         trade_amount=
             TRADE_AMOUNT_USD,
 
-        interval=
-            SCAN_INTERVAL,
-
-        telegram_status=(
-            "🟢 подключён"
-            if telegram_started
-            else "🔴 не подключён"
-        ),
+        min_profit=
+            MIN_NET_PROFIT_PERCENT,
 
         exchanges_count=
             len(exchanges),
@@ -2485,26 +3268,11 @@ def index():
         total_coins=
             len(SYMBOLS),
 
-        current_symbol=
-            current,
-
-        current_index=
-            current_index,
-
         total_scans=
             scans,
 
-        total_found=
-            found,
-
-        last_scan=(
-            scan_time.strftime(
-                "%d.%m.%Y %H:%M:%S"
-            )
-            if scan_time
-            else
-            "Ожидание первого скана"
-        ),
+        current_symbols=
+            current,
     )
 
 
@@ -2523,13 +3291,11 @@ def scan_api():
             last_opportunities
         )
 
-        scan_time = last_scan_time
-
-        current = current_symbol
-
-        current_index = (
-            current_symbol_index
+        current = list(
+            current_symbols
         )
+
+        scan_time = last_scan_time
 
         scans = total_scans
 
@@ -2537,28 +3303,35 @@ def scan_api():
             total_opportunities_found
         )
 
+    with stats_lock:
+
+        order_book_requests = (
+            total_order_book_requests
+        )
+
+        successful_order_books = (
+            total_successful_order_books
+        )
+
     return jsonify({
 
         "status":
             "success",
 
-        "scan_active":
+        "test_mode":
+            True,
+
+        "scanner_active":
             scanner_started,
 
         "telegram_active":
             telegram_started,
 
-        "parallel_requests":
-            True,
+        "trade_amount_usd":
+            TRADE_AMOUNT_USD,
 
-        "order_book_check":
-            True,
-
-        "liquidity_check":
-            True,
-
-        "double_telegram_check":
-            True,
+        "min_net_profit_percent":
+            MIN_NET_PROFIT_PERCENT,
 
         "total_coins":
             len(SYMBOLS),
@@ -2575,23 +3348,17 @@ def scan_api():
         "currently_scanning":
             current,
 
-        "current_coin_number":
-            current_index,
-
-        "scan_progress":
-            f"{current_index}/{len(SYMBOLS)}",
-
-        "trade_amount":
-            TRADE_AMOUNT_USD,
-
-        "min_net_profit_percent":
-            MIN_NET_PROFIT_PERCENT,
-
         "total_scans":
             scans,
 
         "total_opportunities_found":
             found,
+
+        "order_book_requests":
+            order_book_requests,
+
+        "successful_order_books":
+            successful_order_books,
 
         "last_scan": (
             scan_time.isoformat()
@@ -2613,45 +3380,41 @@ def health():
 
     start_background_services()
 
+    with stats_lock:
+
+        order_book_requests = (
+            total_order_book_requests
+        )
+
+        successful_order_books = (
+            total_successful_order_books
+        )
+
     return jsonify({
 
         "status":
             "ok",
 
+        "test_mode":
+            True,
+
         "scanner":
             scanner_started,
 
-        "telegram_configured": bool(
-            TELEGRAM_BOT_TOKEN
-            and TELEGRAM_CHAT_ID
-        ),
-
-        "telegram_polling":
+        "telegram":
             telegram_started,
-
-        "parallel_requests":
-            True,
-
-        "order_book_check":
-            True,
-
-        "liquidity_check":
-            True,
-
-        "double_telegram_check":
-            True,
-
-        "min_profit":
-            MIN_NET_PROFIT_PERCENT,
 
         "trade_amount":
             TRADE_AMOUNT_USD,
 
+        "min_profit":
+            MIN_NET_PROFIT_PERCENT,
+
         "total_coins":
             len(SYMBOLS),
 
-        "symbols_count":
-            len(SYMBOLS),
+        "symbols":
+            SYMBOLS,
 
         "exchanges_count":
             len(exchanges),
@@ -2659,20 +3422,32 @@ def health():
         "exchanges":
             list(exchanges.keys()),
 
-        "currently_scanning":
-            current_symbol,
+        "order_book_requests":
+            order_book_requests,
 
-        "current_coin_number":
-            current_symbol_index,
+        "successful_order_books":
+            successful_order_books,
 
-        "scan_progress":
-            f"{current_symbol_index}/{len(SYMBOLS)}",
+        "constant_thread_pool":
+            True,
 
-        "total_scans":
-            total_scans,
+        "parallel_symbols":
+            True,
 
-        "total_opportunities_found":
-            total_opportunities_found,
+        "order_book_check":
+            True,
+
+        "execution_zone_liquidity":
+            True,
+
+        "freshness_check":
+            True,
+
+        "double_telegram_check":
+            True,
+
+        "quality_score":
+            True,
     })
 
 
@@ -2691,9 +3466,19 @@ if __name__ == "__main__":
         )
     )
 
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=False,
-        use_reloader=False,
-    )
+    try:
+
+        app.run(
+            host="0.0.0.0",
+            port=port,
+            debug=False,
+            use_reloader=False,
+            threaded=True,
+        )
+
+    finally:
+
+        executor.shutdown(
+            wait=False,
+            cancel_futures=True,
+        )
