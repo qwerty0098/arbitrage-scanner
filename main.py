@@ -50,17 +50,27 @@ MAX_NOTIFICATIONS_PER_SCAN = 3
 # ============================================================
 
 EXCHANGE_FEES = {
-    "kraken": 0.26,
-    "kucoin": 0.10,
-    "bitget": 0.10,
+    "binance": 0.10,
+    "okx": 0.10,
     "bybit": 0.10,
+    "bitget": 0.10,
+    "kucoin": 0.10,
+    "kraken": 0.26,
+    "mexc": 0.10,
+    "gate": 0.20,
+    "htx": 0.20,
 }
 
 EXCHANGE_NAMES = {
-    "kraken": "KRAKEN",
-    "kucoin": "KUCOIN",
-    "bitget": "BITGET",
+    "binance": "BINANCE",
+    "okx": "OKX",
     "bybit": "BYBIT",
+    "bitget": "BITGET",
+    "kucoin": "KUCOIN",
+    "kraken": "KRAKEN",
+    "mexc": "MEXC",
+    "gate": "GATE.IO",
+    "htx": "HTX",
 }
 
 
@@ -77,8 +87,6 @@ SYMBOLS = [
     "DOGE/USDT",
     "AVAX/USDT",
     "LINK/USDT",
-
-    # Новые 8 монет
     "BNB/USDT",
     "TRX/USDT",
     "DOT/USDT",
@@ -91,14 +99,19 @@ SYMBOLS = [
 
 
 # ============================================================
-# ПОДКЛЮЧАЕМЫЕ БИРЖИ
+# ПОДКЛЮЧАЕМЫЕ БИРЖИ — ВСЕГО 9
 # ============================================================
 
 EXCHANGE_CLASSES = {
-    "kraken": ccxt.kraken,
-    "kucoin": ccxt.kucoin,
-    "bitget": ccxt.bitget,
+    "binance": ccxt.binance,
+    "okx": ccxt.okx,
     "bybit": ccxt.bybit,
+    "bitget": ccxt.bitget,
+    "kucoin": ccxt.kucoin,
+    "kraken": ccxt.kraken,
+    "mexc": ccxt.mexc,
+    "gate": ccxt.gate,
+    "htx": ccxt.htx,
 }
 
 
@@ -119,7 +132,7 @@ for exchange_id, exchange_class in EXCHANGE_CLASSES.items():
     try:
         exchanges[exchange_id] = exchange_class({
             "enableRateLimit": True,
-            "timeout": 10000,
+            "timeout": 15000,
         })
 
         print(
@@ -1222,9 +1235,7 @@ def scanner_loop():
 
         try:
 
-            print(
-                ""
-            )
+            print("")
 
             print(
                 f"🔄 НАЧАЛО СКАНИРОВАНИЯ "
