@@ -5,7 +5,6 @@ import threading
 from datetime import datetime
 from concurrent.futures import (
     ThreadPoolExecutor,
-    as_completed,
     wait,
 )
 
@@ -35,7 +34,6 @@ TELEGRAM_CHAT_ID = str(
 # РАЗМЕР СДЕЛКИ
 # ============================================================
 
-# Максимальный полный бюджет одной сделки.
 TRADE_AMOUNT_USD = 1000.0
 
 
@@ -61,15 +59,23 @@ EXCHANGE_FEES = {
 
 
 # ============================================================
+# МЯГКИЙ ПРЕДВАРИТЕЛЬНЫЙ ФИЛЬТР
+# ============================================================
+
+# Фильтр больше НЕ учитывает комиссии и минимальную прибыль.
+# Он отбрасывает только направления, где вообще нет положительного
+# спреда по лучшим ценам.
+FAST_PRECHECK_MIN_GROSS_SPREAD_PERCENT = 0.0001
+
+
+# ============================================================
 # СКАНИРОВАНИЕ
 # ============================================================
 
 SCAN_INTERVAL = 10
 
-# Максимальное время одного полного скана.
 TOTAL_SCAN_TIMEOUT = 25
 
-# Максимальное время сканирования одной монеты.
 SYMBOL_SCAN_TIMEOUT = 20
 
 MAX_NOTIFICATIONS_PER_SCAN = 3
@@ -85,11 +91,8 @@ CLEANUP_INTERVAL = 60
 # УЛУЧШЕННЫЙ АНТИСПАМ
 # ============================================================
 
-# Если прибыль улучшилась минимум на это значение,
-# новое уведомление может быть отправлено раньше cooldown.
 NOTIFICATION_PROFIT_IMPROVEMENT_PERCENT = 0.15
 
-# Если качество улучшилось минимум настолько.
 NOTIFICATION_SCORE_IMPROVEMENT = 10.0
 
 
@@ -119,10 +122,8 @@ REJECT_STALE_ORDER_BOOKS = False
 # КЭШ СТАКАНОВ
 # ============================================================
 
-# Стакан можно использовать повторно только очень короткое время.
 ORDER_BOOK_CACHE_TTL = 2.0
 
-# Максимальное количество записей в кэше контролируется очисткой.
 ORDER_BOOK_CACHE_MAX_AGE = 30
 
 
@@ -158,10 +159,8 @@ ORDER_BOOK_WAIT_TIMEOUT = 18
 # ПРОБЛЕМНЫЕ БИРЖИ
 # ============================================================
 
-# После стольких ошибок подряд биржа временно пропускается.
 EXCHANGE_FAILURE_LIMIT = 3
 
-# Время временного отключения проблемной биржи.
 EXCHANGE_FAILURE_COOLDOWN = 60
 
 
@@ -279,8 +278,6 @@ last_scan_diagnostics = {}
 last_sent_notifications = {}
 pending_opportunities = {}
 
-# Кэш:
-# (exchange_id, symbol) -> order_book
 order_book_cache = {}
 
 scanner_started = False
@@ -371,6 +368,8 @@ def create_diagnostics(
 
         "exchanges_skipped_cooldown": 0,
 
+        "order_book_errors": [],
+
         "exchange_pairs_total": 0,
         "exchange_pairs_price_possible": 0,
 
@@ -405,11 +404,25 @@ def add_diagnostics(
 
     for key, value in source.items():
 
-        if key == "symbol":
+        if key in (
+            "symbol",
+            "symbols",
+        ):
 
             continue
 
-        if key == "symbols":
+        if key == "order_book_errors":
+
+            target.setdefault(
+                "order_book_errors",
+                []
+            )
+
+            target[
+                "order_book_errors"
+            ].extend(
+                value
+            )
 
             continue
 
@@ -619,7 +632,9 @@ def load_all_markets():
 
     for future in not_done:
 
-        exchange_id = futures[future]
+        exchange_id = futures[
+            future
+        ]
 
         future.cancel()
 
@@ -814,7 +829,7 @@ def check_telegram_connection():
 <b>{len(exchanges)}</b>
 
 ⚡ Оптимизации:
-<b>КЭШ + ПАРАЛЛЕЛЬНЫЕ ЗАПРОСЫ + АНТИСПАМ</b>
+<b>РЕАЛЬНЫЕ СТАКАНЫ + ПАРАЛЛЕЛЬНЫЕ ЗАПРОСЫ + АНТИСПАМ</b>
 
 🧪 <b>ТЕСТОВЫЙ РЕЖИМ</b>
 Реальные ордера не выставляются.
@@ -943,11 +958,6 @@ def prepare_order_book(
             / 100
         )
     )
-
-    # --------------------------------------------------------
-    # Предрасчёт ликвидности и накопительных уровней.
-    # Это выполняется один раз на стакан.
-    # --------------------------------------------------------
 
     buy_execution_liquidity = 0.0
 
@@ -1302,10 +1312,6 @@ def get_all_order_books_parallel(
 
     network_started = time.time()
 
-    # --------------------------------------------------------
-    # Сначала используем свежий кэш.
-    # --------------------------------------------------------
-
     for exchange_id in exchanges:
 
         supported = (
@@ -1368,10 +1374,6 @@ def get_all_order_books_parallel(
             future
         ] = exchange_id
 
-    # --------------------------------------------------------
-    # Не ждём бесконечно самые медленные биржи.
-    # --------------------------------------------------------
-
     if futures:
 
         done, not_done = wait(
@@ -1407,6 +1409,35 @@ def get_all_order_books_parallel(
                         "order_books_failed"
                     ] += 1
 
+                    with exchange_stats_lock:
+
+                        error_text = (
+                            exchange_stats
+                            .get(
+                                exchange_id,
+                                {},
+                            )
+                            .get(
+                                "last_error"
+                            )
+                        )
+
+                    diagnostics[
+                        "order_book_errors"
+                    ].append(
+                        {
+                            "exchange":
+                                exchange_id,
+
+                            "symbol":
+                                symbol,
+
+                            "error":
+                                error_text
+                                or "Не удалось получить стакан",
+                        }
+                    )
+
             except Exception as e:
 
                 diagnostics[
@@ -1416,6 +1447,21 @@ def get_all_order_books_parallel(
                 update_exchange_failure(
                     exchange_id,
                     e,
+                )
+
+                diagnostics[
+                    "order_book_errors"
+                ].append(
+                    {
+                        "exchange":
+                            exchange_id,
+
+                        "symbol":
+                            symbol,
+
+                        "error":
+                            str(e)[:300],
+                    }
                 )
 
         for future in not_done:
@@ -1430,9 +1476,28 @@ def get_all_order_books_parallel(
                 "order_books_failed"
             ] += 1
 
+            timeout_error = (
+                "Timeout ожидания стакана"
+            )
+
             update_exchange_failure(
                 exchange_id,
-                "Timeout ожидания стакана",
+                timeout_error,
+            )
+
+            diagnostics[
+                "order_book_errors"
+            ].append(
+                {
+                    "exchange":
+                        exchange_id,
+
+                    "symbol":
+                        symbol,
+
+                    "error":
+                        timeout_error,
+                }
             )
 
             print(
@@ -1609,7 +1674,7 @@ def simulate_sell(
 
 
 # ============================================================
-# БЫСТРЫЙ ФИЛЬТР
+# МЯГКИЙ БЫСТРЫЙ ФИЛЬТР
 # ============================================================
 
 def passes_fast_precheck(
@@ -1643,78 +1708,39 @@ def passes_fast_precheck(
             "price",
         )
 
-    if sell_bid <= buy_ask:
-
-        return (
-            False,
-            "price",
-        )
-
-    buy_fee_percent = (
-        EXCHANGE_FEES.get(
-            buy_exchange,
-            0.20,
-        )
-    )
-
-    sell_fee_percent = (
-        EXCHANGE_FEES.get(
-            sell_exchange,
-            0.20,
-        )
-    )
-
-    # --------------------------------------------------------
-    # Консервативная оценка.
-    #
-    # Уже здесь учитываются:
-    # - комиссия покупки
-    # - комиссия продажи
-    # - защитный буфер
-    # - минимальная прибыль
-    # --------------------------------------------------------
-
-    estimated_buy_multiplier = (
-        1
-        + (
-            buy_fee_percent
-            + EXTRA_COST_BUFFER_PERCENT
-        )
-        / 100
-    )
-
-    estimated_sell_multiplier = (
-        1
-        - sell_fee_percent / 100
-    )
-
-    estimated_net_multiplier = (
+    gross_spread_percent = (
         (
             sell_bid
-            * estimated_sell_multiplier
+            - buy_ask
         )
-        / (
-            buy_ask
-            * estimated_buy_multiplier
-        )
-    )
-
-    estimated_net_percent = (
-        (
-            estimated_net_multiplier
-            - 1
-        )
+        / buy_ask
         * 100
     )
 
+    # --------------------------------------------------------
+    # ВАЖНО:
+    #
+    # Здесь больше НЕ учитываются:
+    # - комиссия покупки;
+    # - комиссия продажи;
+    # - защитный буфер;
+    # - минимальная чистая прибыль.
+    #
+    # Все они считаются только после моделирования реального
+    # исполнения по глубине стаканов.
+    #
+    # Этот фильтр теперь только отсекает направления, где
+    # положительного спреда фактически нет.
+    # --------------------------------------------------------
+
     if (
-        estimated_net_percent
-        < MIN_NET_PROFIT_PERCENT
+        gross_spread_percent
+        < FAST_PRECHECK_MIN_GROSS_SPREAD_PERCENT
     ):
 
         return (
             False,
-            "fee",
+            "spread",
         )
 
     return (
@@ -1883,11 +1909,6 @@ def calculate_order_book_opportunity(
             )
         )
 
-        # ----------------------------------------------------
-        # Ликвидность уже была рассчитана при получении
-        # стакана. Повторного прохода по уровням нет.
-        # ----------------------------------------------------
-
         buy_liquidity = (
             buy_order_book[
                 "buy_execution_liquidity"
@@ -2029,19 +2050,6 @@ def calculate_order_book_opportunity(
             * 100
         )
 
-        if (
-            net_profit_percent
-            < MIN_NET_PROFIT_PERCENT
-        ):
-
-            if diagnostics is not None:
-
-                diagnostics[
-                    "rejected_profit"
-                ] += 1
-
-            return None
-
         gross_spread_percent = (
             (
                 sell_result["average_price"]
@@ -2079,6 +2087,10 @@ def calculate_order_book_opportunity(
             * 100
         )
 
+        # ----------------------------------------------------
+        # Сначала проверяем реальное исполнение.
+        # ----------------------------------------------------
+
         if (
             buy_slippage_percent
             > MAX_BUY_SLIPPAGE_PERCENT
@@ -2101,6 +2113,24 @@ def calculate_order_book_opportunity(
 
                 diagnostics[
                     "rejected_sell_slippage"
+                ] += 1
+
+            return None
+
+        # ----------------------------------------------------
+        # Только теперь принимается окончательное решение
+        # по чистой прибыли.
+        # ----------------------------------------------------
+
+        if (
+            net_profit_percent
+            < MIN_NET_PROFIT_PERCENT
+        ):
+
+            if diagnostics is not None:
+
+                diagnostics[
+                    "rejected_profit"
                 ] += 1
 
             return None
@@ -2351,12 +2381,6 @@ def scan_symbol(
             diagnostics,
         )
 
-    # --------------------------------------------------------
-    # Сначала сортируем по цене.
-    #
-    # Это позволяет быстрее отбрасывать направления.
-    # --------------------------------------------------------
-
     buy_candidates = sorted(
         exchange_ids,
         key=lambda exchange_id:
@@ -2393,11 +2417,6 @@ def scan_symbol(
 
                 continue
 
-            # ------------------------------------------------
-            # Если даже текущий sell bid не выше buy ask,
-            # дальнейшие более дешёвые продажи бессмысленны.
-            # ------------------------------------------------
-
             sell_book = order_books[
                 sell_exchange
             ]
@@ -2424,17 +2443,9 @@ def scan_symbol(
 
             if not passes:
 
-                if reason == "fee":
-
-                    diagnostics[
-                        "rejected_fast_fee_precheck"
-                    ] += 1
-
-                else:
-
-                    diagnostics[
-                        "rejected_fast_precheck"
-                    ] += 1
+                diagnostics[
+                    "rejected_fast_precheck"
+                ] += 1
 
                 continue
 
@@ -2595,10 +2606,6 @@ def scan_all():
             f"сканирования: {symbol}"
         )
 
-    # --------------------------------------------------------
-    # Убираем дубликаты одинакового направления.
-    # --------------------------------------------------------
-
     unique_opportunities = {}
 
     for opportunity in all_opportunities:
@@ -2701,6 +2708,18 @@ def print_diagnostics(
         f"{diagnostics.get('order_books_failed', 0)}"
     )
 
+    for error in diagnostics.get(
+        "order_book_errors",
+        []
+    ):
+
+        print(
+            f"⚠️ Ошибка стакана: "
+            f"{error.get('exchange')} "
+            f"{error.get('symbol')} — "
+            f"{error.get('error')}"
+        )
+
     print(
         f"⏸ Бирж в cooldown: "
         f"{diagnostics.get('exchanges_skipped_cooldown', 0)}"
@@ -2712,23 +2731,13 @@ def print_diagnostics(
     )
 
     print(
-        f"🔎 После ценового фильтра: "
+        f"🔎 После мягкого фильтра: "
         f"{diagnostics.get('exchange_pairs_price_possible', 0)}"
     )
 
     print(
-        f"🚫 Быстрый ценовой фильтр: "
+        f"🚫 Отсеяно по спреду: "
         f"{diagnostics.get('rejected_fast_precheck', 0)}"
-    )
-
-    print(
-        f"💸 Отсеяно комиссиями заранее: "
-        f"{diagnostics.get('rejected_fast_fee_precheck', 0)}"
-    )
-
-    print(
-        f"🧮 Полных расчётов: "
-        f"{diagnostics.get('full_calculations', 0)}"
     )
 
     print(
@@ -2742,8 +2751,23 @@ def print_diagnostics(
     )
 
     print(
-        f"📈 Недостаточная прибыль: "
+        f"📉 Проскальзывание покупки: "
+        f"{diagnostics.get('rejected_buy_slippage', 0)}"
+    )
+
+    print(
+        f"📉 Проскальзывание продажи: "
+        f"{diagnostics.get('rejected_sell_slippage', 0)}"
+    )
+
+    print(
+        f"📈 Отсеяно после полного расчёта: "
         f"{diagnostics.get('rejected_profit', 0)}"
+    )
+
+    print(
+        f"🧮 Полных расчётов: "
+        f"{diagnostics.get('full_calculations', 0)}"
     )
 
     print(
@@ -3208,11 +3232,6 @@ def recheck_opportunity(
             ]
         )
 
-    # --------------------------------------------------------
-    # Повторная проверка всегда идёт напрямую.
-    # Кэш здесь намеренно не используется.
-    # --------------------------------------------------------
-
     buy_future = NETWORK_EXECUTOR.submit(
         get_order_book,
         buy_exchange,
@@ -3282,7 +3301,8 @@ def recheck_opportunity(
         return (
             None,
             "После повторной проверки "
-            "быстрый фильтр больше не проходит.",
+            "направление больше не имеет "
+            "положительного ценового спреда.",
         )
 
     current_opportunity = (
@@ -3304,7 +3324,7 @@ def recheck_opportunity(
             "возможность больше не соответствует "
             "требованиям по ликвидности, "
             "исполнению, проскальзыванию "
-            "или прибыли.",
+            "или чистой прибыли.",
         )
 
     return (
@@ -3576,6 +3596,25 @@ def send_scan_diagnostics_to_telegram(
     diagnostics
 ):
 
+    error_lines = []
+
+    for error in diagnostics.get(
+        "order_book_errors",
+        []
+    )[:10]:
+
+        error_lines.append(
+            f"• <b>{error.get('exchange')}</b> "
+            f"{error.get('symbol')}: "
+            f"{error.get('error')}"
+        )
+
+    errors_text = (
+        "\n".join(error_lines)
+        if error_lines
+        else "Нет"
+    )
+
     text = f"""
 📊 <b>ДИАГНОСТИКА СКАНА</b>
 
@@ -3591,20 +3630,35 @@ def send_scan_diagnostics_to_telegram(
 ❌ Ошибок:
 <b>{diagnostics.get('order_books_failed', 0)}</b>
 
+⚠️ Детали ошибок:
+{errors_text}
+
 ⏸ Бирж в cooldown:
 <b>{diagnostics.get('exchanges_skipped_cooldown', 0)}</b>
 
 🔗 Направлений:
 <b>{diagnostics.get('exchange_pairs_total', 0)}</b>
 
-💸 Отсеяно комиссиями заранее:
-<b>{diagnostics.get('rejected_fast_fee_precheck', 0)}</b>
+🚫 Отсеяно по спреду:
+<b>{diagnostics.get('rejected_fast_precheck', 0)}</b>
+
+💧 Отсеяно по ликвидности покупки:
+<b>{diagnostics.get('rejected_buy_liquidity', 0)}</b>
+
+💧 Отсеяно по ликвидности продажи:
+<b>{diagnostics.get('rejected_sell_liquidity', 0)}</b>
+
+📉 Проскальзывание покупки:
+<b>{diagnostics.get('rejected_buy_slippage', 0)}</b>
+
+📉 Проскальзывание продажи:
+<b>{diagnostics.get('rejected_sell_slippage', 0)}</b>
+
+📈 Отсеяно после полного расчёта:
+<b>{diagnostics.get('rejected_profit', 0)}</b>
 
 🧮 Полных расчётов:
 <b>{diagnostics.get('full_calculations', 0)}</b>
-
-📈 Недостаточная прибыль:
-<b>{diagnostics.get('rejected_profit', 0)}</b>
 
 🎯 Возможностей:
 <b>{diagnostics.get('final_opportunities', 0)}</b>
@@ -3833,6 +3887,16 @@ def start_background_services():
             f"{TOTAL_SCAN_TIMEOUT} сек."
         )
 
+        print(
+            "🔎 Предварительный фильтр: "
+            "ТОЛЬКО МЯГКАЯ ПРОВЕРКА СПРЕДА"
+        )
+
+        print(
+            "🧮 Комиссии и прибыль: "
+            "ПОСЛЕ РЕАЛЬНОГО ИСПОЛНЕНИЯ ПО СТАКАНУ"
+        )
+
         load_all_markets()
 
         telegram_ok = (
@@ -4011,6 +4075,13 @@ th {
     text-align: left;
 }
 
+.error-item {
+    padding: 10px;
+    margin-top: 8px;
+    background: #2a2025;
+    border-radius: 10px;
+}
+
 </style>
 
 </head>
@@ -4075,13 +4146,18 @@ th {
 
 <br><br>
 
-💾 Кэш стаканов:
-<b>ВКЛЮЧЕН</b>
+🔎 Предварительный фильтр:
+<b>ТОЛЬКО ПОЛОЖИТЕЛЬНЫЙ СПРЕД</b>
 
 <br><br>
 
-⚡ Оптимизированные расчёты:
-<b>ВКЛЮЧЕНЫ</b>
+🧮 Комиссии и прибыль:
+<b>СЧИТАЮТСЯ ПОСЛЕ ИСПОЛНЕНИЯ ПО СТАКАНУ</b>
+
+<br><br>
+
+💾 Кэш стаканов:
+<b>ВКЛЮЧЕН</b>
 
 <br><br>
 
@@ -4129,18 +4205,38 @@ th {
 </tr>
 
 <tr>
-<td>Отсеяно комиссиями заранее</td>
-<td>{{ diagnostics.rejected_fast_fee_precheck }}</td>
+<td>Отсеяно по спреду</td>
+<td>{{ diagnostics.rejected_fast_precheck }}</td>
+</tr>
+
+<tr>
+<td>Отсеяно по ликвидности покупки</td>
+<td>{{ diagnostics.rejected_buy_liquidity }}</td>
+</tr>
+
+<tr>
+<td>Отсеяно по ликвидности продажи</td>
+<td>{{ diagnostics.rejected_sell_liquidity }}</td>
+</tr>
+
+<tr>
+<td>Отсеяно по проскальзыванию покупки</td>
+<td>{{ diagnostics.rejected_buy_slippage }}</td>
+</tr>
+
+<tr>
+<td>Отсеяно по проскальзыванию продажи</td>
+<td>{{ diagnostics.rejected_sell_slippage }}</td>
+</tr>
+
+<tr>
+<td>Отсеяно после полного расчёта</td>
+<td>{{ diagnostics.rejected_profit }}</td>
 </tr>
 
 <tr>
 <td>Полных расчётов</td>
 <td>{{ diagnostics.full_calculations }}</td>
-</tr>
-
-<tr>
-<td>Недостаточная прибыль</td>
-<td>{{ diagnostics.rejected_profit }}</td>
 </tr>
 
 <tr>
@@ -4164,6 +4260,26 @@ th {
 </tr>
 
 </table>
+
+{% if diagnostics.order_book_errors %}
+
+<h3>⚠️ Ошибки получения стаканов</h3>
+
+{% for error in diagnostics.order_book_errors %}
+
+<div class="error-item">
+
+<b>{{ error.exchange }} — {{ error.symbol }}</b>
+
+<br><br>
+
+{{ error.error }}
+
+</div>
+
+{% endfor %}
+
+{% endif %}
 
 </div>
 
@@ -4274,9 +4390,14 @@ ${{ op.sell_exchange_liquidity }}
 
 <br><br>
 
-Смотри блок диагностики —
-теперь видно скорость скана,
-кэш и количество отсеянных направлений.
+Теперь направления не отбрасываются заранее
+по грубой оценке комиссий.
+
+<br><br>
+
+Комиссии и фактическая прибыль считаются
+только после моделирования покупки и продажи
+по реальной глубине стаканов.
 
 </div>
 
@@ -4323,6 +4444,15 @@ def index():
 
         diagnostics = dict(
             last_scan_diagnostics
+        )
+
+        diagnostics[
+            "order_book_errors"
+        ] = list(
+            last_scan_diagnostics.get(
+                "order_book_errors",
+                []
+            )
         )
 
     return render_template_string(
@@ -4383,6 +4513,15 @@ def scan_api():
 
         diagnostics = dict(
             last_scan_diagnostics
+        )
+
+        diagnostics[
+            "order_book_errors"
+        ] = list(
+            last_scan_diagnostics.get(
+                "order_book_errors",
+                []
+            )
         )
 
     with stats_lock:
@@ -4525,6 +4664,12 @@ def health():
             True,
 
         "diagnostics":
+            True,
+
+        "soft_precheck":
+            True,
+
+        "commissions_calculated_after_execution":
             True,
     })
 
