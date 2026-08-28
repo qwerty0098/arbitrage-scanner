@@ -6,6 +6,7 @@ from datetime import datetime
 from concurrent.futures import (
     ThreadPoolExecutor,
     as_completed,
+    wait,
 )
 
 import ccxt
@@ -34,11 +35,7 @@ TELEGRAM_CHAT_ID = str(
 # РАЗМЕР СДЕЛКИ
 # ============================================================
 
-# Максимальный фактический бюджет на одну сделку.
-# В него входят:
-# - стоимость покупки монеты
-# - комиссия покупки
-# - дополнительный защитный буфер
+# Максимальный полный бюджет одной сделки.
 TRADE_AMOUNT_USD = 1000.0
 
 
@@ -46,16 +43,10 @@ TRADE_AMOUNT_USD = 1000.0
 # ПРИБЫЛЬ И КОМИССИИ
 # ============================================================
 
-# Минимальная чистая прибыль после полного расчёта.
 MIN_NET_PROFIT_PERCENT = 0.20
 
-# Дополнительный резерв на небольшое ухудшение исполнения.
 EXTRA_COST_BUFFER_PERCENT = 0.05
 
-
-# Комиссии taker в процентах.
-# При реальной торговле желательно заменить на комиссии
-# именно вашего аккаунта.
 EXCHANGE_FEES = {
     "binance": 0.10,
     "okx": 0.10,
@@ -75,6 +66,12 @@ EXCHANGE_FEES = {
 
 SCAN_INTERVAL = 10
 
+# Максимальное время одного полного скана.
+TOTAL_SCAN_TIMEOUT = 25
+
+# Максимальное время сканирования одной монеты.
+SYMBOL_SCAN_TIMEOUT = 20
+
 MAX_NOTIFICATIONS_PER_SCAN = 3
 
 NOTIFICATION_COOLDOWN = 300
@@ -85,17 +82,25 @@ CLEANUP_INTERVAL = 60
 
 
 # ============================================================
+# УЛУЧШЕННЫЙ АНТИСПАМ
+# ============================================================
+
+# Если прибыль улучшилась минимум на это значение,
+# новое уведомление может быть отправлено раньше cooldown.
+NOTIFICATION_PROFIT_IMPROVEMENT_PERCENT = 0.15
+
+# Если качество улучшилось минимум настолько.
+NOTIFICATION_SCORE_IMPROVEMENT = 10.0
+
+
+# ============================================================
 # ДИАГНОСТИКА
 # ============================================================
 
-# Включить подробную статистику в Railway logs.
 DEBUG_DIAGNOSTICS = True
 
-# Отправлять краткую диагностику в Telegram после каждого скана.
 TELEGRAM_DIAGNOSTICS = False
 
-# Если True — отправляем сообщение в Telegram даже если
-# не найдено ни одной итоговой возможности.
 TELEGRAM_ZERO_OPPORTUNITIES_ALERT = False
 
 
@@ -105,12 +110,20 @@ TELEGRAM_ZERO_OPPORTUNITIES_ALERT = False
 
 MAX_ORDER_BOOK_AGE_SECONDS = 15
 
-# Некоторые биржи не передают timestamp.
 ALLOW_ORDER_BOOK_WITHOUT_TIMESTAMP = True
 
-# Старый timestamp не отбрасывает стакан автоматически.
-# Вместо этого стакан получает штраф качества.
 REJECT_STALE_ORDER_BOOKS = False
+
+
+# ============================================================
+# КЭШ СТАКАНОВ
+# ============================================================
+
+# Стакан можно использовать повторно только очень короткое время.
+ORDER_BOOK_CACHE_TTL = 2.0
+
+# Максимальное количество записей в кэше контролируется очисткой.
+ORDER_BOOK_CACHE_MAX_AGE = 30
 
 
 # ============================================================
@@ -119,7 +132,6 @@ REJECT_STALE_ORDER_BOOKS = False
 
 ORDER_BOOK_LIMIT = 50
 
-# Для тестирования снижаем запас ликвидности.
 LIQUIDITY_SAFETY_MULTIPLIER = 1.05
 
 MAX_BUY_SLIPPAGE_PERCENT = 0.50
@@ -133,15 +145,24 @@ MAX_EXECUTION_PRICE_DEVIATION_PERCENT = 0.75
 # ПАРАЛЛЕЛЬНОСТЬ
 # ============================================================
 
-# Пул только для запуска задач сканирования монет.
-# В нём НЕ выполняются сетевые запросы стаканов.
 SCAN_WORKERS = 4
 
-# Отдельный постоянный пул только для запросов к биржам.
 NETWORK_WORKERS = 36
 
-# Максимальное время ожидания одного сетевого запроса.
-NETWORK_TASK_TIMEOUT = 20
+NETWORK_TASK_TIMEOUT = 15
+
+ORDER_BOOK_WAIT_TIMEOUT = 18
+
+
+# ============================================================
+# ПРОБЛЕМНЫЕ БИРЖИ
+# ============================================================
+
+# После стольких ошибок подряд биржа временно пропускается.
+EXCHANGE_FAILURE_LIMIT = 3
+
+# Время временного отключения проблемной биржи.
+EXCHANGE_FAILURE_COOLDOWN = 60
 
 
 # ============================================================
@@ -203,7 +224,7 @@ app = Flask(__name__)
 
 
 # ============================================================
-# ДВА ПОСТОЯННЫХ ПУЛА ПОТОКОВ
+# ПУЛЫ ПОТОКОВ
 # ============================================================
 
 SCAN_EXECUTOR = ThreadPoolExecutor(
@@ -258,6 +279,10 @@ last_scan_diagnostics = {}
 last_sent_notifications = {}
 pending_opportunities = {}
 
+# Кэш:
+# (exchange_id, symbol) -> order_book
+order_book_cache = {}
+
 scanner_started = False
 telegram_started = False
 services_started = False
@@ -274,8 +299,40 @@ total_failed_order_books = 0
 lock = threading.RLock()
 notification_lock = threading.RLock()
 pending_lock = threading.RLock()
+cache_lock = threading.RLock()
 startup_lock = threading.Lock()
 stats_lock = threading.RLock()
+exchange_stats_lock = threading.RLock()
+
+
+# ============================================================
+# СТАТИСТИКА БИРЖ
+# ============================================================
+
+exchange_stats = {}
+
+for exchange_id in EXCHANGE_CLASSES:
+
+    exchange_stats[exchange_id] = {
+
+        "requests": 0,
+        "successes": 0,
+        "failures": 0,
+
+        "consecutive_failures": 0,
+
+        "disabled_until": 0.0,
+
+        "last_duration": 0.0,
+
+        "total_duration": 0.0,
+
+        "average_duration": 0.0,
+
+        "last_error": None,
+
+        "last_success": None,
+    }
 
 
 # ============================================================
@@ -304,32 +361,40 @@ def create_diagnostics(
 ):
 
     return {
+
         "symbol": symbol,
 
         "order_book_requests": 0,
         "order_books_received": 0,
         "order_books_failed": 0,
+        "order_books_from_cache": 0,
+
+        "exchanges_skipped_cooldown": 0,
 
         "exchange_pairs_total": 0,
-
-        # Направления, где Sell Bid > Buy Ask.
-        # Это ещё НЕ означает наличие прибыли.
         "exchange_pairs_price_possible": 0,
 
-        # Направления, где Sell Bid <= Buy Ask.
         "rejected_fast_precheck": 0,
+        "rejected_fast_fee_precheck": 0,
 
         "rejected_buy_liquidity": 0,
         "rejected_sell_liquidity": 0,
+
         "rejected_buy_execution": 0,
         "rejected_buy_budget": 0,
         "rejected_sell_execution": 0,
+
         "rejected_buy_slippage": 0,
         "rejected_sell_slippage": 0,
+
         "rejected_profit": 0,
 
         "full_calculations": 0,
         "final_opportunities": 0,
+
+        "network_time": 0.0,
+        "calculation_time": 0.0,
+        "total_time": 0.0,
     }
 
 
@@ -341,6 +406,10 @@ def add_diagnostics(
     for key, value in source.items():
 
         if key == "symbol":
+
+            continue
+
+        if key == "symbols":
 
             continue
 
@@ -356,6 +425,129 @@ def add_diagnostics(
                 )
                 + value
             )
+
+
+def update_exchange_success(
+    exchange_id,
+    duration
+):
+
+    current_time = time.time()
+
+    with exchange_stats_lock:
+
+        stats = exchange_stats.setdefault(
+            exchange_id,
+            {}
+        )
+
+        stats["requests"] = (
+            stats.get("requests", 0)
+            + 1
+        )
+
+        stats["successes"] = (
+            stats.get("successes", 0)
+            + 1
+        )
+
+        stats["consecutive_failures"] = 0
+
+        stats["last_duration"] = duration
+
+        stats["total_duration"] = (
+            stats.get(
+                "total_duration",
+                0.0,
+            )
+            + duration
+        )
+
+        successes = stats["successes"]
+
+        if successes > 0:
+
+            stats["average_duration"] = (
+                stats["total_duration"]
+                / successes
+            )
+
+        stats["last_success"] = current_time
+
+        stats["last_error"] = None
+
+
+def update_exchange_failure(
+    exchange_id,
+    error_text
+):
+
+    current_time = time.time()
+
+    with exchange_stats_lock:
+
+        stats = exchange_stats.setdefault(
+            exchange_id,
+            {}
+        )
+
+        stats["requests"] = (
+            stats.get("requests", 0)
+            + 1
+        )
+
+        stats["failures"] = (
+            stats.get("failures", 0)
+            + 1
+        )
+
+        stats["consecutive_failures"] = (
+            stats.get(
+                "consecutive_failures",
+                0,
+            )
+            + 1
+        )
+
+        stats["last_error"] = (
+            str(error_text)[:300]
+        )
+
+        if (
+            stats["consecutive_failures"]
+            >= EXCHANGE_FAILURE_LIMIT
+        ):
+
+            stats["disabled_until"] = (
+                current_time
+                + EXCHANGE_FAILURE_COOLDOWN
+            )
+
+
+def is_exchange_available(
+    exchange_id
+):
+
+    current_time = time.time()
+
+    with exchange_stats_lock:
+
+        stats = exchange_stats.get(
+            exchange_id,
+            {}
+        )
+
+        disabled_until = safe_float(
+            stats.get(
+                "disabled_until",
+                0.0,
+            )
+        )
+
+        return (
+            current_time
+            >= disabled_until
+        )
 
 
 # ============================================================
@@ -381,15 +573,18 @@ def load_all_markets():
 
         futures[future] = exchange_id
 
-    for future in as_completed(futures):
+    done, not_done = wait(
+        futures,
+        timeout=NETWORK_TASK_TIMEOUT,
+    )
+
+    for future in done:
 
         exchange_id = futures[future]
 
         try:
 
-            markets = future.result(
-                timeout=NETWORK_TASK_TIMEOUT
-            )
+            markets = future.result()
 
             supported = set()
 
@@ -421,6 +616,21 @@ def load_all_markets():
                 f"❌ load_markets "
                 f"{exchange_id}: {e}"
             )
+
+    for future in not_done:
+
+        exchange_id = futures[future]
+
+        future.cancel()
+
+        available_symbols_by_exchange[
+            exchange_id
+        ] = set()
+
+        print(
+            f"⏱ load_markets timeout: "
+            f"{exchange_id}"
+        )
 
     print("=" * 55)
     print("")
@@ -491,23 +701,18 @@ def send_telegram_message(
 
     if not TELEGRAM_BOT_TOKEN:
 
-        print(
-            "❌ TELEGRAM_BOT_TOKEN отсутствует"
-        )
-
         return None
 
     if not TELEGRAM_CHAT_ID:
 
-        print(
-            "❌ TELEGRAM_CHAT_ID отсутствует"
-        )
-
         return None
 
     data = {
+
         "chat_id": TELEGRAM_CHAT_ID,
+
         "text": text,
+
         "parse_mode": "HTML",
     }
 
@@ -520,7 +725,6 @@ def send_telegram_message(
     return telegram_api(
         "sendMessage",
         data,
-        request_method="POST",
     )
 
 
@@ -542,7 +746,7 @@ def answer_callback_query(
 
 
 # ============================================================
-# TELEGRAM ПРОВЕРКА
+# ПРОВЕРКА TELEGRAM
 # ============================================================
 
 def check_telegram_connection():
@@ -570,7 +774,7 @@ def check_telegram_connection():
 
     result = telegram_api(
         "getMe",
-        request_method="GET"
+        request_method="GET",
     )
 
     if not result or not result.get("ok"):
@@ -588,7 +792,7 @@ def check_telegram_connection():
 
     bot_name = bot.get(
         "username",
-        "unknown"
+        "unknown",
     )
 
     startup_text = f"""
@@ -609,14 +813,8 @@ def check_telegram_connection():
 🏦 Бирж:
 <b>{len(exchanges)}</b>
 
-⚡ Пул сканирования:
-<b>{SCAN_WORKERS} потоков</b>
-
-🌐 Сетевой пул:
-<b>{NETWORK_WORKERS} потоков</b>
-
-📊 Диагностика причин отбрасывания:
-<b>ВКЛЮЧЕНА</b>
+⚡ Оптимизации:
+<b>КЭШ + ПАРАЛЛЕЛЬНЫЕ ЗАПРОСЫ + АНТИСПАМ</b>
 
 🧪 <b>ТЕСТОВЫЙ РЕЖИМ</b>
 Реальные ордера не выставляются.
@@ -633,20 +831,13 @@ def check_telegram_connection():
             f"@{bot_name}"
         )
 
-        print("=" * 55)
-
         return True
-
-    print(
-        "❌ Не удалось отправить "
-        "стартовое сообщение"
-    )
 
     return False
 
 
 # ============================================================
-# ОЧИСТКА УРОВНЕЙ СТАКАНА
+# ОЧИСТКА УРОВНЕЙ
 # ============================================================
 
 def clean_order_levels(
@@ -686,10 +877,291 @@ def clean_order_levels(
         ):
 
             clean_levels.append(
-                [price, amount]
+                (
+                    price,
+                    amount,
+                )
             )
 
     return clean_levels
+
+
+# ============================================================
+# ПРЕДРАСЧЁТ СТАКАНА
+# ============================================================
+
+def prepare_order_book(
+    order_book,
+    started_at,
+    received_at
+):
+
+    asks = clean_order_levels(
+        order_book.get(
+            "asks",
+            [],
+        )
+    )
+
+    bids = clean_order_levels(
+        order_book.get(
+            "bids",
+            [],
+        )
+    )
+
+    if not asks or not bids:
+
+        return None
+
+    asks.sort(
+        key=lambda x: x[0]
+    )
+
+    bids.sort(
+        key=lambda x: x[0],
+        reverse=True,
+    )
+
+    best_ask = asks[0][0]
+    best_bid = bids[0][0]
+
+    buy_max_price = (
+        best_ask
+        * (
+            1
+            + MAX_EXECUTION_PRICE_DEVIATION_PERCENT
+            / 100
+        )
+    )
+
+    sell_min_price = (
+        best_bid
+        * (
+            1
+            - MAX_EXECUTION_PRICE_DEVIATION_PERCENT
+            / 100
+        )
+    )
+
+    # --------------------------------------------------------
+    # Предрасчёт ликвидности и накопительных уровней.
+    # Это выполняется один раз на стакан.
+    # --------------------------------------------------------
+
+    buy_execution_liquidity = 0.0
+
+    prepared_asks = []
+
+    for price, amount in asks:
+
+        if price > buy_max_price:
+
+            break
+
+        level_value = price * amount
+
+        buy_execution_liquidity += (
+            level_value
+        )
+
+        prepared_asks.append(
+            (
+                price,
+                amount,
+                level_value,
+            )
+        )
+
+    sell_execution_liquidity = 0.0
+
+    prepared_bids = []
+
+    for price, amount in bids:
+
+        if price < sell_min_price:
+
+            break
+
+        level_value = price * amount
+
+        sell_execution_liquidity += (
+            level_value
+        )
+
+        prepared_bids.append(
+            (
+                price,
+                amount,
+                level_value,
+            )
+        )
+
+    exchange_timestamp = (
+        order_book.get(
+            "timestamp"
+        )
+    )
+
+    timestamp_age = None
+
+    if exchange_timestamp:
+
+        try:
+
+            timestamp_seconds = (
+                float(exchange_timestamp)
+                / 1000
+            )
+
+            timestamp_age = (
+                received_at
+                - timestamp_seconds
+            )
+
+        except Exception:
+
+            timestamp_age = None
+
+    is_stale = False
+
+    if timestamp_age is not None:
+
+        is_stale = (
+            timestamp_age
+            > MAX_ORDER_BOOK_AGE_SECONDS
+        )
+
+    elif not ALLOW_ORDER_BOOK_WITHOUT_TIMESTAMP:
+
+        is_stale = True
+
+    if (
+        is_stale
+        and REJECT_STALE_ORDER_BOOKS
+    ):
+
+        return None
+
+    return {
+
+        "asks": asks,
+        "bids": bids,
+
+        "prepared_asks":
+            prepared_asks,
+
+        "prepared_bids":
+            prepared_bids,
+
+        "best_ask":
+            best_ask,
+
+        "best_bid":
+            best_bid,
+
+        "buy_max_price":
+            buy_max_price,
+
+        "sell_min_price":
+            sell_min_price,
+
+        "buy_execution_liquidity":
+            buy_execution_liquidity,
+
+        "sell_execution_liquidity":
+            sell_execution_liquidity,
+
+        "exchange_timestamp":
+            exchange_timestamp,
+
+        "timestamp_age":
+            timestamp_age,
+
+        "is_stale":
+            is_stale,
+
+        "received_at":
+            received_at,
+
+        "request_duration":
+            received_at
+            - started_at,
+    }
+
+
+# ============================================================
+# КЭШ
+# ============================================================
+
+def get_cached_order_book(
+    exchange_id,
+    symbol
+):
+
+    cache_key = (
+        exchange_id,
+        symbol,
+    )
+
+    current_time = time.time()
+
+    with cache_lock:
+
+        cached = order_book_cache.get(
+            cache_key
+        )
+
+        if not cached:
+
+            return None
+
+        cached_at = safe_float(
+            cached.get(
+                "cached_at",
+                0.0,
+            )
+        )
+
+        if (
+            current_time
+            - cached_at
+            > ORDER_BOOK_CACHE_TTL
+        ):
+
+            return None
+
+        result = dict(cached)
+
+        result["from_cache"] = True
+
+        return result
+
+
+def save_order_book_cache(
+    exchange_id,
+    symbol,
+    order_book
+):
+
+    cache_key = (
+        exchange_id,
+        symbol,
+    )
+
+    cached = dict(order_book)
+
+    cached["cached_at"] = (
+        time.time()
+    )
+
+    cached["from_cache"] = False
+
+    with cache_lock:
+
+        order_book_cache[
+            cache_key
+        ] = cached
 
 
 # ============================================================
@@ -698,12 +1170,21 @@ def clean_order_levels(
 
 def get_order_book(
     exchange_id,
-    symbol
+    symbol,
+    use_cache=True
 ):
 
     global total_order_book_requests
     global total_successful_order_books
     global total_failed_order_books
+
+    if (
+        not is_exchange_available(
+            exchange_id
+        )
+    ):
+
+        return None
 
     exchange = exchanges.get(
         exchange_id
@@ -727,6 +1208,17 @@ def get_order_book(
 
         return None
 
+    if use_cache:
+
+        cached = get_cached_order_book(
+            exchange_id,
+            symbol,
+        )
+
+        if cached:
+
+            return cached
+
     started_at = time.time()
 
     with stats_lock:
@@ -742,119 +1234,45 @@ def get_order_book(
 
         received_at = time.time()
 
-        asks = clean_order_levels(
-            order_book.get(
-                "asks",
-                [],
+        prepared = prepare_order_book(
+            order_book,
+            started_at,
+            received_at,
+        )
+
+        if not prepared:
+
+            raise ValueError(
+                "Пустой или некорректный стакан"
             )
+
+        update_exchange_success(
+            exchange_id,
+            prepared[
+                "request_duration"
+            ],
         )
 
-        bids = clean_order_levels(
-            order_book.get(
-                "bids",
-                [],
-            )
+        save_order_book_cache(
+            exchange_id,
+            symbol,
+            prepared,
         )
-
-        if not asks or not bids:
-
-            with stats_lock:
-
-                total_failed_order_books += 1
-
-            return None
-
-        asks.sort(
-            key=lambda x: x[0]
-        )
-
-        bids.sort(
-            key=lambda x: x[0],
-            reverse=True,
-        )
-
-        exchange_timestamp = (
-            order_book.get(
-                "timestamp"
-            )
-        )
-
-        timestamp_age = None
-
-        if exchange_timestamp:
-
-            try:
-
-                timestamp_seconds = (
-                    float(exchange_timestamp)
-                    / 1000
-                )
-
-                timestamp_age = (
-                    received_at
-                    - timestamp_seconds
-                )
-
-            except Exception:
-
-                timestamp_age = None
-
-        is_stale = False
-
-        if timestamp_age is not None:
-
-            if (
-                timestamp_age
-                > MAX_ORDER_BOOK_AGE_SECONDS
-            ):
-
-                is_stale = True
-
-        elif not ALLOW_ORDER_BOOK_WITHOUT_TIMESTAMP:
-
-            is_stale = True
-
-        if (
-            is_stale
-            and REJECT_STALE_ORDER_BOOKS
-        ):
-
-            with stats_lock:
-
-                total_failed_order_books += 1
-
-            return None
 
         with stats_lock:
 
             total_successful_order_books += 1
 
-        return {
+        prepared["from_cache"] = False
 
-            "asks": asks,
-            "bids": bids,
-
-            "best_ask": asks[0][0],
-            "best_bid": bids[0][0],
-
-            "exchange_timestamp":
-                exchange_timestamp,
-
-            "timestamp_age":
-                timestamp_age,
-
-            "is_stale":
-                is_stale,
-
-            "received_at":
-                received_at,
-
-            "request_duration":
-                received_at
-                - started_at,
-        }
+        return prepared
 
     except Exception as e:
+
+        update_exchange_failure(
+            exchange_id,
+            e,
+        )
 
         with stats_lock:
 
@@ -870,7 +1288,7 @@ def get_order_book(
 
 
 # ============================================================
-# ПАРАЛЛЕЛЬНОЕ ПОЛУЧЕНИЕ ВСЕХ СТАКАНОВ
+# ПАРАЛЛЕЛЬНОЕ ПОЛУЧЕНИЕ СТАКАНОВ
 # ============================================================
 
 def get_all_order_books_parallel(
@@ -881,6 +1299,12 @@ def get_all_order_books_parallel(
     results = {}
 
     futures = {}
+
+    network_started = time.time()
+
+    # --------------------------------------------------------
+    # Сначала используем свежий кэш.
+    # --------------------------------------------------------
 
     for exchange_id in exchanges:
 
@@ -898,6 +1322,37 @@ def get_all_order_books_parallel(
 
             continue
 
+        if not is_exchange_available(
+            exchange_id
+        ):
+
+            diagnostics[
+                "exchanges_skipped_cooldown"
+            ] += 1
+
+            continue
+
+        cached = get_cached_order_book(
+            exchange_id,
+            symbol,
+        )
+
+        if cached:
+
+            results[
+                exchange_id
+            ] = cached
+
+            diagnostics[
+                "order_books_received"
+            ] += 1
+
+            diagnostics[
+                "order_books_from_cache"
+            ] += 1
+
+            continue
+
         diagnostics[
             "order_book_requests"
         ] += 1
@@ -906,57 +1361,98 @@ def get_all_order_books_parallel(
             get_order_book,
             exchange_id,
             symbol,
+            False,
         )
 
         futures[
             future
         ] = exchange_id
 
-    for future in as_completed(
-        futures
-    ):
+    # --------------------------------------------------------
+    # Не ждём бесконечно самые медленные биржи.
+    # --------------------------------------------------------
 
-        exchange_id = futures[
-            future
-        ]
+    if futures:
 
-        try:
+        done, not_done = wait(
+            futures,
+            timeout=ORDER_BOOK_WAIT_TIMEOUT,
+        )
 
-            order_book = future.result()
+        for future in done:
 
-            if order_book:
+            exchange_id = futures[
+                future
+            ]
 
-                results[
-                    exchange_id
-                ] = order_book
+            try:
 
-                diagnostics[
-                    "order_books_received"
-                ] += 1
+                order_book = (
+                    future.result()
+                )
 
-            else:
+                if order_book:
+
+                    results[
+                        exchange_id
+                    ] = order_book
+
+                    diagnostics[
+                        "order_books_received"
+                    ] += 1
+
+                else:
+
+                    diagnostics[
+                        "order_books_failed"
+                    ] += 1
+
+            except Exception as e:
 
                 diagnostics[
                     "order_books_failed"
                 ] += 1
 
-        except Exception as e:
+                update_exchange_failure(
+                    exchange_id,
+                    e,
+                )
+
+        for future in not_done:
+
+            exchange_id = futures[
+                future
+            ]
+
+            future.cancel()
 
             diagnostics[
                 "order_books_failed"
             ] += 1
 
-            print(
-                f"⚠️ Ошибка "
-                f"{exchange_id} "
-                f"{symbol}: {e}"
+            update_exchange_failure(
+                exchange_id,
+                "Timeout ожидания стакана",
             )
+
+            print(
+                f"⏱ Timeout стакана: "
+                f"{exchange_id} "
+                f"{symbol}"
+            )
+
+    diagnostics[
+        "network_time"
+    ] += (
+        time.time()
+        - network_started
+    )
 
     return results
 
 
 # ============================================================
-# РАСЧЁТ ДОСТУПНОЙ СУММЫ НА ПОКУПКУ
+# БЮДЖЕТ
 # ============================================================
 
 def calculate_asset_budget(
@@ -982,11 +1478,11 @@ def calculate_asset_budget(
 # ============================================================
 
 def simulate_buy(
-    asks,
+    prepared_asks,
     quote_amount
 ):
 
-    if not asks:
+    if not prepared_asks:
 
         return None
 
@@ -997,31 +1493,15 @@ def simulate_buy(
     total_spent = 0.0
     total_quantity = 0.0
 
-    best_ask = asks[0][0]
-
-    max_price = (
-        best_ask
-        * (
-            1
-            + MAX_EXECUTION_PRICE_DEVIATION_PERCENT
-            / 100
-        )
-    )
-
-    for price, available_quantity in asks:
-
-        if price > max_price:
-
-            break
+    for (
+        price,
+        available_quantity,
+        level_value,
+    ) in prepared_asks:
 
         if remaining_usd <= 0:
 
             break
-
-        level_value = (
-            price
-            * available_quantity
-        )
 
         spend = min(
             remaining_usd,
@@ -1044,22 +1524,17 @@ def simulate_buy(
 
         return None
 
-    average_price = (
-        total_spent
-        / total_quantity
-    )
-
     return {
 
-        "spent": total_spent,
+        "spent":
+            total_spent,
 
-        "quantity": total_quantity,
+        "quantity":
+            total_quantity,
 
         "average_price":
-            average_price,
-
-        "max_price":
-            max_price,
+            total_spent
+            / total_quantity,
     }
 
 
@@ -1068,11 +1543,11 @@ def simulate_buy(
 # ============================================================
 
 def simulate_sell(
-    bids,
+    prepared_bids,
     quantity
 ):
 
-    if not bids:
+    if not prepared_bids:
 
         return None
 
@@ -1083,22 +1558,11 @@ def simulate_sell(
     total_revenue = 0.0
     total_sold = 0.0
 
-    best_bid = bids[0][0]
-
-    min_price = (
-        best_bid
-        * (
-            1
-            - MAX_EXECUTION_PRICE_DEVIATION_PERCENT
-            / 100
-        )
-    )
-
-    for price, available_quantity in bids:
-
-        if price < min_price:
-
-            break
+    for (
+        price,
+        available_quantity,
+        level_value,
+    ) in prepared_bids:
 
         if remaining_quantity <= 0:
 
@@ -1114,8 +1578,13 @@ def simulate_sell(
             * price
         )
 
-        total_sold += sell_quantity
-        remaining_quantity -= sell_quantity
+        total_sold += (
+            sell_quantity
+        )
+
+        remaining_quantity -= (
+            sell_quantity
+        )
 
     if remaining_quantity > 0.00000001:
 
@@ -1125,99 +1594,18 @@ def simulate_sell(
 
         return None
 
-    average_price = (
-        total_revenue
-        / total_sold
-    )
-
     return {
 
-        "revenue": total_revenue,
+        "revenue":
+            total_revenue,
 
-        "quantity": total_sold,
+        "quantity":
+            total_sold,
 
         "average_price":
-            average_price,
-
-        "min_price":
-            min_price,
+            total_revenue
+            / total_sold,
     }
-
-
-# ============================================================
-# ЛИКВИДНОСТЬ ПОКУПКИ
-# ============================================================
-
-def calculate_buy_execution_liquidity(
-    asks
-):
-
-    if not asks:
-
-        return 0.0
-
-    best_ask = asks[0][0]
-
-    max_price = (
-        best_ask
-        * (
-            1
-            + MAX_EXECUTION_PRICE_DEVIATION_PERCENT
-            / 100
-        )
-    )
-
-    liquidity = 0.0
-
-    for price, amount in asks:
-
-        if price > max_price:
-
-            break
-
-        liquidity += (
-            price * amount
-        )
-
-    return liquidity
-
-
-# ============================================================
-# ЛИКВИДНОСТЬ ПРОДАЖИ
-# ============================================================
-
-def calculate_sell_execution_liquidity(
-    bids
-):
-
-    if not bids:
-
-        return 0.0
-
-    best_bid = bids[0][0]
-
-    min_price = (
-        best_bid
-        * (
-            1
-            - MAX_EXECUTION_PRICE_DEVIATION_PERCENT
-            / 100
-        )
-    )
-
-    liquidity = 0.0
-
-    for price, amount in bids:
-
-        if price < min_price:
-
-            break
-
-        liquidity += (
-            price * amount
-        )
-
-    return liquidity
 
 
 # ============================================================
@@ -1231,7 +1619,6 @@ def passes_fast_precheck(
     sell_order_book
 ):
 
-    # Получаем лучшие цены безопасно.
     buy_ask = safe_float(
         buy_order_book.get(
             "best_ask",
@@ -1246,42 +1633,94 @@ def passes_fast_precheck(
         )
     )
 
-    # --------------------------------------------------------
-    # ЗАЩИТА ОТ НЕКОРРЕКТНЫХ ЦЕН
-    # --------------------------------------------------------
+    if (
+        buy_ask <= 0
+        or sell_bid <= 0
+    ):
 
-    if buy_ask <= 0:
-
-        return False
-
-    if sell_bid <= 0:
-
-        return False
-
-
-    # --------------------------------------------------------
-    # ВАЖНО
-    #
-    # Быстрый фильтр НЕ учитывает заранее:
-    #
-    # - комиссию покупки
-    # - комиссию продажи
-    # - защитный буфер
-    # - минимальную чистую прибыль
-    #
-    # Эти параметры проверяются только после реальной
-    # симуляции покупки и продажи по уровням стакана.
-    #
-    # Здесь проверяется только наличие потенциального
-    # положительного ценового направления.
-    # --------------------------------------------------------
+        return (
+            False,
+            "price",
+        )
 
     if sell_bid <= buy_ask:
 
-        return False
+        return (
+            False,
+            "price",
+        )
 
+    buy_fee_percent = (
+        EXCHANGE_FEES.get(
+            buy_exchange,
+            0.20,
+        )
+    )
 
-    return True
+    sell_fee_percent = (
+        EXCHANGE_FEES.get(
+            sell_exchange,
+            0.20,
+        )
+    )
+
+    # --------------------------------------------------------
+    # Консервативная оценка.
+    #
+    # Уже здесь учитываются:
+    # - комиссия покупки
+    # - комиссия продажи
+    # - защитный буфер
+    # - минимальная прибыль
+    # --------------------------------------------------------
+
+    estimated_buy_multiplier = (
+        1
+        + (
+            buy_fee_percent
+            + EXTRA_COST_BUFFER_PERCENT
+        )
+        / 100
+    )
+
+    estimated_sell_multiplier = (
+        1
+        - sell_fee_percent / 100
+    )
+
+    estimated_net_multiplier = (
+        (
+            sell_bid
+            * estimated_sell_multiplier
+        )
+        / (
+            buy_ask
+            * estimated_buy_multiplier
+        )
+    )
+
+    estimated_net_percent = (
+        (
+            estimated_net_multiplier
+            - 1
+        )
+        * 100
+    )
+
+    if (
+        estimated_net_percent
+        < MIN_NET_PROFIT_PERCENT
+    ):
+
+        return (
+            False,
+            "fee",
+        )
+
+    return (
+        True,
+        None,
+    )
 
 
 # ============================================================
@@ -1414,461 +1853,461 @@ def calculate_order_book_opportunity(
     diagnostics=None,
 ):
 
-    if diagnostics is not None:
+    calculation_started = time.time()
 
-        diagnostics[
-            "full_calculations"
-        ] += 1
-
-
-    # --------------------------------------------------------
-    # КОМИССИЯ И БЮДЖЕТ
-    # --------------------------------------------------------
-
-    buy_fee_percent = (
-        EXCHANGE_FEES.get(
-            buy_exchange,
-            0.20,
-        )
-    )
-
-    sell_fee_percent = (
-        EXCHANGE_FEES.get(
-            sell_exchange,
-            0.20,
-        )
-    )
-
-    asset_budget = (
-        calculate_asset_budget(
-            buy_fee_percent
-        )
-    )
-
-
-    # --------------------------------------------------------
-    # ЛИКВИДНОСТЬ ПОКУПКИ
-    # --------------------------------------------------------
-
-    buy_liquidity = (
-        calculate_buy_execution_liquidity(
-            buy_order_book["asks"]
-        )
-    )
-
-    required_buy_liquidity = (
-        asset_budget
-        * LIQUIDITY_SAFETY_MULTIPLIER
-    )
-
-    if (
-        buy_liquidity
-        < required_buy_liquidity
-    ):
+    try:
 
         if diagnostics is not None:
 
             diagnostics[
-                "rejected_buy_liquidity"
+                "full_calculations"
             ] += 1
 
-        return None
-
-
-    # --------------------------------------------------------
-    # РЕАЛЬНАЯ ПОКУПКА
-    # --------------------------------------------------------
-
-    buy_result = simulate_buy(
-        buy_order_book["asks"],
-        asset_budget,
-    )
-
-    if not buy_result:
-
-        if diagnostics is not None:
-
-            diagnostics[
-                "rejected_buy_execution"
-            ] += 1
-
-        return None
-
-
-    buy_fee_usd = (
-        buy_result["spent"]
-        * buy_fee_percent
-        / 100
-    )
-
-    buy_extra_buffer_usd = (
-        buy_result["spent"]
-        * EXTRA_COST_BUFFER_PERCENT
-        / 100
-    )
-
-    buy_cost = (
-        buy_result["spent"]
-        + buy_fee_usd
-        + buy_extra_buffer_usd
-    )
-
-    if buy_cost > TRADE_AMOUNT_USD:
-
-        if diagnostics is not None:
-
-            diagnostics[
-                "rejected_buy_budget"
-            ] += 1
-
-        return None
-
-
-    # --------------------------------------------------------
-    # ЛИКВИДНОСТЬ ПРОДАЖИ
-    # --------------------------------------------------------
-
-    sell_liquidity = (
-        calculate_sell_execution_liquidity(
-            sell_order_book["bids"]
-        )
-    )
-
-    required_sell_liquidity = (
-        buy_result["quantity"]
-        * sell_order_book["best_bid"]
-        * LIQUIDITY_SAFETY_MULTIPLIER
-    )
-
-    if (
-        sell_liquidity
-        < required_sell_liquidity
-    ):
-
-        if diagnostics is not None:
-
-            diagnostics[
-                "rejected_sell_liquidity"
-            ] += 1
-
-        return None
-
-
-    # --------------------------------------------------------
-    # РЕАЛЬНАЯ ПРОДАЖА
-    # --------------------------------------------------------
-
-    sell_result = simulate_sell(
-        sell_order_book["bids"],
-        buy_result["quantity"],
-    )
-
-    if not sell_result:
-
-        if diagnostics is not None:
-
-            diagnostics[
-                "rejected_sell_execution"
-            ] += 1
-
-        return None
-
-
-    sell_fee_usd = (
-        sell_result["revenue"]
-        * sell_fee_percent
-        / 100
-    )
-
-    sell_revenue = (
-        sell_result["revenue"]
-        - sell_fee_usd
-    )
-
-
-    # --------------------------------------------------------
-    # ПРИБЫЛЬ
-    # --------------------------------------------------------
-
-    net_profit_usd = (
-        sell_revenue
-        - buy_cost
-    )
-
-    if buy_cost <= 0:
-
-        return None
-
-    net_profit_percent = (
-        net_profit_usd
-        / buy_cost
-    ) * 100
-
-    if (
-        net_profit_percent
-        < MIN_NET_PROFIT_PERCENT
-    ):
-
-        if diagnostics is not None:
-
-            diagnostics[
-                "rejected_profit"
-            ] += 1
-
-        return None
-
-
-    # --------------------------------------------------------
-    # ВАЛОВЫЙ СПРЕД
-    # --------------------------------------------------------
-
-    gross_spread_percent = (
-        (
-            sell_result["average_price"]
-            - buy_result["average_price"]
-        )
-        / buy_result["average_price"]
-    ) * 100
-
-
-    # --------------------------------------------------------
-    # ПРОСКАЛЬЗЫВАНИЕ
-    # --------------------------------------------------------
-
-    buy_slippage_percent = (
-        (
-            buy_result["average_price"]
-            - buy_order_book["best_ask"]
-        )
-        / buy_order_book["best_ask"]
-    ) * 100
-
-    sell_slippage_percent = (
-        (
-            sell_order_book["best_bid"]
-            - sell_result["average_price"]
-        )
-        / sell_order_book["best_bid"]
-    ) * 100
-
-
-    if (
-        buy_slippage_percent
-        > MAX_BUY_SLIPPAGE_PERCENT
-    ):
-
-        if diagnostics is not None:
-
-            diagnostics[
-                "rejected_buy_slippage"
-            ] += 1
-
-        return None
-
-
-    if (
-        sell_slippage_percent
-        > MAX_SELL_SLIPPAGE_PERCENT
-    ):
-
-        if diagnostics is not None:
-
-            diagnostics[
-                "rejected_sell_slippage"
-            ] += 1
-
-        return None
-
-
-    # --------------------------------------------------------
-    # РЕЙТИНГ
-    # --------------------------------------------------------
-
-    quality_score = (
-        calculate_opportunity_score(
-            net_profit_percent,
-            gross_spread_percent,
-            buy_slippage_percent,
-            sell_slippage_percent,
-            buy_liquidity,
-            sell_liquidity,
-            buy_order_book["is_stale"],
-            sell_order_book["is_stale"],
-        )
-    )
-
-    quality_label = (
-        get_quality_label(
-            quality_score
-        )
-    )
-
-
-    # --------------------------------------------------------
-    # УСПЕШНАЯ ВОЗМОЖНОСТЬ
-    # --------------------------------------------------------
-
-    if diagnostics is not None:
-
-        diagnostics[
-            "final_opportunities"
-        ] += 1
-
-
-    return {
-
-        "symbol":
-            symbol,
-
-        "buy_exchange":
-            buy_exchange,
-
-        "buy_exchange_name":
-            EXCHANGE_NAMES.get(
+        buy_fee_percent = (
+            EXCHANGE_FEES.get(
                 buy_exchange,
-                buy_exchange.upper(),
-            ),
+                0.20,
+            )
+        )
 
-        "buy_price":
-            round(
-                buy_result["average_price"],
-                8,
-            ),
-
-        "buy_best_ask":
-            round(
-                buy_order_book["best_ask"],
-                8,
-            ),
-
-        "buy_exchange_liquidity":
-            round(
-                buy_liquidity,
-                2,
-            ),
-
-        "sell_exchange":
-            sell_exchange,
-
-        "sell_exchange_name":
-            EXCHANGE_NAMES.get(
+        sell_fee_percent = (
+            EXCHANGE_FEES.get(
                 sell_exchange,
-                sell_exchange.upper(),
-            ),
+                0.20,
+            )
+        )
 
-        "sell_price":
-            round(
-                sell_result["average_price"],
-                8,
-            ),
+        asset_budget = (
+            calculate_asset_budget(
+                buy_fee_percent
+            )
+        )
 
-        "sell_best_bid":
-            round(
-                sell_order_book["best_bid"],
-                8,
-            ),
+        # ----------------------------------------------------
+        # Ликвидность уже была рассчитана при получении
+        # стакана. Повторного прохода по уровням нет.
+        # ----------------------------------------------------
 
-        "sell_exchange_liquidity":
-            round(
-                sell_liquidity,
-                2,
-            ),
+        buy_liquidity = (
+            buy_order_book[
+                "buy_execution_liquidity"
+            ]
+        )
 
-        "quantity":
-            buy_result["quantity"],
+        required_buy_liquidity = (
+            asset_budget
+            * LIQUIDITY_SAFETY_MULTIPLIER
+        )
 
-        "asset_budget":
-            round(
-                asset_budget,
-                2,
-            ),
+        if (
+            buy_liquidity
+            < required_buy_liquidity
+        ):
 
-        "actual_buy_cost":
-            round(
-                buy_cost,
-                2,
-            ),
+            if diagnostics is not None:
 
-        "buy_fee_usd":
-            round(
-                buy_fee_usd,
-                2,
-            ),
+                diagnostics[
+                    "rejected_buy_liquidity"
+                ] += 1
 
-        "buy_extra_buffer_usd":
-            round(
-                buy_extra_buffer_usd,
-                2,
-            ),
+            return None
 
-        "sell_fee_usd":
-            round(
-                sell_fee_usd,
-                2,
-            ),
+        buy_result = simulate_buy(
+            buy_order_book[
+                "prepared_asks"
+            ],
+            asset_budget,
+        )
 
-        "gross_spread_percent":
-            round(
-                gross_spread_percent,
-                4,
-            ),
+        if not buy_result:
 
-        "net_profit_percent":
-            round(
+            if diagnostics is not None:
+
+                diagnostics[
+                    "rejected_buy_execution"
+                ] += 1
+
+            return None
+
+        buy_fee_usd = (
+            buy_result["spent"]
+            * buy_fee_percent
+            / 100
+        )
+
+        buy_extra_buffer_usd = (
+            buy_result["spent"]
+            * EXTRA_COST_BUFFER_PERCENT
+            / 100
+        )
+
+        buy_cost = (
+            buy_result["spent"]
+            + buy_fee_usd
+            + buy_extra_buffer_usd
+        )
+
+        if buy_cost > TRADE_AMOUNT_USD:
+
+            if diagnostics is not None:
+
+                diagnostics[
+                    "rejected_buy_budget"
+                ] += 1
+
+            return None
+
+        sell_liquidity = (
+            sell_order_book[
+                "sell_execution_liquidity"
+            ]
+        )
+
+        required_sell_liquidity = (
+            buy_result["quantity"]
+            * sell_order_book[
+                "best_bid"
+            ]
+            * LIQUIDITY_SAFETY_MULTIPLIER
+        )
+
+        if (
+            sell_liquidity
+            < required_sell_liquidity
+        ):
+
+            if diagnostics is not None:
+
+                diagnostics[
+                    "rejected_sell_liquidity"
+                ] += 1
+
+            return None
+
+        sell_result = simulate_sell(
+            sell_order_book[
+                "prepared_bids"
+            ],
+            buy_result[
+                "quantity"
+            ],
+        )
+
+        if not sell_result:
+
+            if diagnostics is not None:
+
+                diagnostics[
+                    "rejected_sell_execution"
+                ] += 1
+
+            return None
+
+        sell_fee_usd = (
+            sell_result["revenue"]
+            * sell_fee_percent
+            / 100
+        )
+
+        sell_revenue = (
+            sell_result["revenue"]
+            - sell_fee_usd
+        )
+
+        net_profit_usd = (
+            sell_revenue
+            - buy_cost
+        )
+
+        if buy_cost <= 0:
+
+            return None
+
+        net_profit_percent = (
+            net_profit_usd
+            / buy_cost
+            * 100
+        )
+
+        if (
+            net_profit_percent
+            < MIN_NET_PROFIT_PERCENT
+        ):
+
+            if diagnostics is not None:
+
+                diagnostics[
+                    "rejected_profit"
+                ] += 1
+
+            return None
+
+        gross_spread_percent = (
+            (
+                sell_result["average_price"]
+                - buy_result["average_price"]
+            )
+            / buy_result["average_price"]
+            * 100
+        )
+
+        buy_slippage_percent = (
+            (
+                buy_result["average_price"]
+                - buy_order_book[
+                    "best_ask"
+                ]
+            )
+            / buy_order_book[
+                "best_ask"
+            ]
+            * 100
+        )
+
+        sell_slippage_percent = (
+            (
+                sell_order_book[
+                    "best_bid"
+                ]
+                - sell_result[
+                    "average_price"
+                ]
+            )
+            / sell_order_book[
+                "best_bid"
+            ]
+            * 100
+        )
+
+        if (
+            buy_slippage_percent
+            > MAX_BUY_SLIPPAGE_PERCENT
+        ):
+
+            if diagnostics is not None:
+
+                diagnostics[
+                    "rejected_buy_slippage"
+                ] += 1
+
+            return None
+
+        if (
+            sell_slippage_percent
+            > MAX_SELL_SLIPPAGE_PERCENT
+        ):
+
+            if diagnostics is not None:
+
+                diagnostics[
+                    "rejected_sell_slippage"
+                ] += 1
+
+            return None
+
+        quality_score = (
+            calculate_opportunity_score(
                 net_profit_percent,
-                4,
-            ),
-
-        "net_profit_usd":
-            round(
-                net_profit_usd,
-                2,
-            ),
-
-        "buy_fee_percent":
-            buy_fee_percent,
-
-        "sell_fee_percent":
-            sell_fee_percent,
-
-        "buy_slippage_percent":
-            round(
+                gross_spread_percent,
                 buy_slippage_percent,
-                4,
-            ),
-
-        "sell_slippage_percent":
-            round(
                 sell_slippage_percent,
-                4,
-            ),
+                buy_liquidity,
+                sell_liquidity,
+                buy_order_book[
+                    "is_stale"
+                ],
+                sell_order_book[
+                    "is_stale"
+                ],
+            )
+        )
 
-        "quality_score":
-            quality_score,
+        quality_label = (
+            get_quality_label(
+                quality_score
+            )
+        )
 
-        "quality_label":
-            quality_label,
+        if diagnostics is not None:
 
-        "buy_order_book_age":
-            buy_order_book[
-                "timestamp_age"
-            ],
+            diagnostics[
+                "final_opportunities"
+            ] += 1
 
-        "sell_order_book_age":
-            sell_order_book[
-                "timestamp_age"
-            ],
+        return {
 
-        "buy_order_book_stale":
-            buy_order_book[
-                "is_stale"
-            ],
+            "symbol": symbol,
 
-        "sell_order_book_stale":
-            sell_order_book[
-                "is_stale"
-            ],
-    }
+            "buy_exchange":
+                buy_exchange,
+
+            "buy_exchange_name":
+                EXCHANGE_NAMES.get(
+                    buy_exchange,
+                    buy_exchange.upper(),
+                ),
+
+            "buy_price":
+                round(
+                    buy_result[
+                        "average_price"
+                    ],
+                    8,
+                ),
+
+            "buy_best_ask":
+                round(
+                    buy_order_book[
+                        "best_ask"
+                    ],
+                    8,
+                ),
+
+            "buy_exchange_liquidity":
+                round(
+                    buy_liquidity,
+                    2,
+                ),
+
+            "sell_exchange":
+                sell_exchange,
+
+            "sell_exchange_name":
+                EXCHANGE_NAMES.get(
+                    sell_exchange,
+                    sell_exchange.upper(),
+                ),
+
+            "sell_price":
+                round(
+                    sell_result[
+                        "average_price"
+                    ],
+                    8,
+                ),
+
+            "sell_best_bid":
+                round(
+                    sell_order_book[
+                        "best_bid"
+                    ],
+                    8,
+                ),
+
+            "sell_exchange_liquidity":
+                round(
+                    sell_liquidity,
+                    2,
+                ),
+
+            "quantity":
+                buy_result[
+                    "quantity"
+                ],
+
+            "asset_budget":
+                round(
+                    asset_budget,
+                    2,
+                ),
+
+            "actual_buy_cost":
+                round(
+                    buy_cost,
+                    2,
+                ),
+
+            "buy_fee_usd":
+                round(
+                    buy_fee_usd,
+                    2,
+                ),
+
+            "buy_extra_buffer_usd":
+                round(
+                    buy_extra_buffer_usd,
+                    2,
+                ),
+
+            "sell_fee_usd":
+                round(
+                    sell_fee_usd,
+                    2,
+                ),
+
+            "gross_spread_percent":
+                round(
+                    gross_spread_percent,
+                    4,
+                ),
+
+            "net_profit_percent":
+                round(
+                    net_profit_percent,
+                    4,
+                ),
+
+            "net_profit_usd":
+                round(
+                    net_profit_usd,
+                    2,
+                ),
+
+            "buy_fee_percent":
+                buy_fee_percent,
+
+            "sell_fee_percent":
+                sell_fee_percent,
+
+            "buy_slippage_percent":
+                round(
+                    buy_slippage_percent,
+                    4,
+                ),
+
+            "sell_slippage_percent":
+                round(
+                    sell_slippage_percent,
+                    4,
+                ),
+
+            "quality_score":
+                quality_score,
+
+            "quality_label":
+                quality_label,
+
+            "buy_order_book_age":
+                buy_order_book[
+                    "timestamp_age"
+                ],
+
+            "sell_order_book_age":
+                sell_order_book[
+                    "timestamp_age"
+                ],
+
+            "buy_order_book_stale":
+                buy_order_book[
+                    "is_stale"
+                ],
+
+            "sell_order_book_stale":
+                sell_order_book[
+                    "is_stale"
+                ],
+        }
+
+    finally:
+
+        if diagnostics is not None:
+
+            diagnostics[
+                "calculation_time"
+            ] += (
+                time.time()
+                - calculation_started
+            )
 
 
 # ============================================================
@@ -1878,6 +2317,8 @@ def calculate_order_book_opportunity(
 def scan_symbol(
     symbol
 ):
+
+    scan_started = time.time()
 
     diagnostics = create_diagnostics(
         symbol
@@ -1898,56 +2339,102 @@ def scan_symbol(
 
     if len(exchange_ids) < 2:
 
+        diagnostics[
+            "total_time"
+        ] = (
+            time.time()
+            - scan_started
+        )
+
         return (
             opportunities,
             diagnostics,
         )
 
-
     # --------------------------------------------------------
-    # ПРОВЕРКА ВСЕХ НАПРАВЛЕНИЙ
+    # Сначала сортируем по цене.
+    #
+    # Это позволяет быстрее отбрасывать направления.
     # --------------------------------------------------------
 
-    for buy_exchange in exchange_ids:
+    buy_candidates = sorted(
+        exchange_ids,
+        key=lambda exchange_id:
+            order_books[
+                exchange_id
+            ]["best_ask"],
+    )
+
+    sell_candidates = sorted(
+        exchange_ids,
+        key=lambda exchange_id:
+            order_books[
+                exchange_id
+            ]["best_bid"],
+        reverse=True,
+    )
+
+    for buy_exchange in buy_candidates:
 
         buy_book = order_books[
             buy_exchange
         ]
 
-        for sell_exchange in exchange_ids:
+        buy_ask = buy_book[
+            "best_ask"
+        ]
 
-            if buy_exchange == sell_exchange:
+        for sell_exchange in sell_candidates:
+
+            if (
+                sell_exchange
+                == buy_exchange
+            ):
 
                 continue
 
-            diagnostics[
-                "exchange_pairs_total"
-            ] += 1
+            # ------------------------------------------------
+            # Если даже текущий sell bid не выше buy ask,
+            # дальнейшие более дешёвые продажи бессмысленны.
+            # ------------------------------------------------
 
             sell_book = order_books[
                 sell_exchange
             ]
 
-            # ------------------------------------------------
-            # ПРЕДВАРИТЕЛЬНАЯ ПРОВЕРКА
-            #
-            # Здесь отбрасываются только направления, где
-            # цена продажи не выше цены покупки.
-            #
-            # Комиссии и минимальная прибыль проверяются
-            # только в полном расчёте.
-            # ------------------------------------------------
-
-            if not passes_fast_precheck(
-                buy_exchange,
-                buy_book,
-                sell_exchange,
-                sell_book,
+            if (
+                sell_book["best_bid"]
+                <= buy_ask
             ):
 
-                diagnostics[
-                    "rejected_fast_precheck"
-                ] += 1
+                break
+
+            diagnostics[
+                "exchange_pairs_total"
+            ] += 1
+
+            passes, reason = (
+                passes_fast_precheck(
+                    buy_exchange,
+                    buy_book,
+                    sell_exchange,
+                    sell_book,
+                )
+            )
+
+            if not passes:
+
+                if reason == "fee":
+
+                    diagnostics[
+                        "rejected_fast_fee_precheck"
+                    ] += 1
+
+                else:
+
+                    diagnostics[
+                        "rejected_fast_precheck"
+                    ] += 1
 
                 continue
 
@@ -1957,12 +2444,12 @@ def scan_symbol(
 
             opportunity = (
                 calculate_order_book_opportunity(
-                    symbol=symbol,
-                    buy_exchange=buy_exchange,
-                    buy_order_book=buy_book,
-                    sell_exchange=sell_exchange,
-                    sell_order_book=sell_book,
-                    diagnostics=diagnostics,
+                    symbol,
+                    buy_exchange,
+                    buy_book,
+                    sell_exchange,
+                    sell_book,
+                    diagnostics,
                 )
             )
 
@@ -1972,6 +2459,12 @@ def scan_symbol(
                     opportunity
                 )
 
+    diagnostics[
+        "total_time"
+    ] = (
+        time.time()
+        - scan_started
+    )
 
     return (
         opportunities,
@@ -1980,7 +2473,7 @@ def scan_symbol(
 
 
 # ============================================================
-# WORKER СКАНИРОВАНИЯ
+# WORKER
 # ============================================================
 
 def scan_symbol_worker(
@@ -2018,6 +2511,8 @@ def scan_symbol_worker(
 
 def scan_all():
 
+    scan_started = time.time()
+
     all_opportunities = []
 
     total_diagnostics = create_diagnostics(
@@ -2039,9 +2534,12 @@ def scan_all():
             future
         ] = symbol
 
-    for future in as_completed(
-        futures
-    ):
+    done, not_done = wait(
+        futures,
+        timeout=TOTAL_SCAN_TIMEOUT,
+    )
+
+    for future in done:
 
         symbol = futures[
             future
@@ -2077,10 +2575,69 @@ def scan_all():
                 f"{symbol}: {e}"
             )
 
+    for future in not_done:
+
+        symbol = futures[
+            future
+        ]
+
+        future.cancel()
+
+        symbol_diagnostics[
+            symbol
+        ] = {
+            "symbol": symbol,
+            "error": "Превышен общий timeout",
+        }
+
+        print(
+            f"⏱ Общий timeout "
+            f"сканирования: {symbol}"
+        )
+
+    # --------------------------------------------------------
+    # Убираем дубликаты одинакового направления.
+    # --------------------------------------------------------
+
+    unique_opportunities = {}
+
+    for opportunity in all_opportunities:
+
+        key = (
+            opportunity["symbol"],
+            opportunity["buy_exchange"],
+            opportunity["sell_exchange"],
+        )
+
+        existing = (
+            unique_opportunities.get(
+                key
+            )
+        )
+
+        if (
+            not existing
+            or opportunity[
+                "net_profit_percent"
+            ]
+            > existing[
+                "net_profit_percent"
+            ]
+        ):
+
+            unique_opportunities[
+                key
+            ] = opportunity
+
+    all_opportunities = list(
+        unique_opportunities.values()
+    )
+
     all_opportunities.sort(
         key=lambda x: (
             x["quality_score"],
             x["net_profit_percent"],
+            x["net_profit_usd"],
         ),
         reverse=True,
     )
@@ -2095,6 +2652,13 @@ def scan_all():
         all_opportunities
     )
 
+    total_diagnostics[
+        "total_time"
+    ] = (
+        time.time()
+        - scan_started
+    )
+
     return (
         all_opportunities,
         total_diagnostics,
@@ -2102,7 +2666,7 @@ def scan_all():
 
 
 # ============================================================
-# ВЫВОД ДИАГНОСТИКИ
+# ДИАГНОСТИКА
 # ============================================================
 
 def print_diagnostics(
@@ -2119,111 +2683,94 @@ def print_diagnostics(
 
     print(
         f"📚 Запросов стаканов: "
-        f"{diagnostics['order_book_requests']}"
+        f"{diagnostics.get('order_book_requests', 0)}"
+    )
+
+    print(
+        f"💾 Из кэша: "
+        f"{diagnostics.get('order_books_from_cache', 0)}"
     )
 
     print(
         f"✅ Стаканов получено: "
-        f"{diagnostics['order_books_received']}"
+        f"{diagnostics.get('order_books_received', 0)}"
     )
 
     print(
-        f"❌ Стаканов не получено: "
-        f"{diagnostics['order_books_failed']}"
+        f"❌ Ошибок стаканов: "
+        f"{diagnostics.get('order_books_failed', 0)}"
     )
 
     print(
-        f"🔗 Всего направлений: "
-        f"{diagnostics['exchange_pairs_total']}"
+        f"⏸ Бирж в cooldown: "
+        f"{diagnostics.get('exchanges_skipped_cooldown', 0)}"
     )
 
     print(
-        f"🔎 Направлений с положительным спредом: "
-        f"{diagnostics['exchange_pairs_price_possible']}"
+        f"🔗 Проверено направлений: "
+        f"{diagnostics.get('exchange_pairs_total', 0)}"
     )
 
     print(
-        f"🚫 Нет положительного ценового направления: "
-        f"{diagnostics['rejected_fast_precheck']}"
+        f"🔎 После ценового фильтра: "
+        f"{diagnostics.get('exchange_pairs_price_possible', 0)}"
     )
 
     print(
-        f"🧮 Полных расчётов выполнено: "
-        f"{diagnostics['full_calculations']}"
+        f"🚫 Быстрый ценовой фильтр: "
+        f"{diagnostics.get('rejected_fast_precheck', 0)}"
     )
 
     print(
-        f"💧 Покупка — ликвидность: "
-        f"{diagnostics['rejected_buy_liquidity']}"
+        f"💸 Отсеяно комиссиями заранее: "
+        f"{diagnostics.get('rejected_fast_fee_precheck', 0)}"
     )
 
     print(
-        f"💧 Продажа — ликвидность: "
-        f"{diagnostics['rejected_sell_liquidity']}"
+        f"🧮 Полных расчётов: "
+        f"{diagnostics.get('full_calculations', 0)}"
     )
 
     print(
-        f"📉 Покупка — исполнение: "
-        f"{diagnostics['rejected_buy_execution']}"
+        f"💧 Недостаточно ликвидности покупки: "
+        f"{diagnostics.get('rejected_buy_liquidity', 0)}"
     )
 
     print(
-        f"📉 Продажа — исполнение: "
-        f"{diagnostics['rejected_sell_execution']}"
-    )
-
-    print(
-        f"💰 Превышен бюджет: "
-        f"{diagnostics['rejected_buy_budget']}"
-    )
-
-    print(
-        f"📉 Проскальзывание покупки: "
-        f"{diagnostics['rejected_buy_slippage']}"
-    )
-
-    print(
-        f"📉 Проскальзывание продажи: "
-        f"{diagnostics['rejected_sell_slippage']}"
+        f"💧 Недостаточно ликвидности продажи: "
+        f"{diagnostics.get('rejected_sell_liquidity', 0)}"
     )
 
     print(
         f"📈 Недостаточная прибыль: "
-        f"{diagnostics['rejected_profit']}"
+        f"{diagnostics.get('rejected_profit', 0)}"
     )
 
     print(
-        f"🎯 ИТОГОВЫХ ВОЗМОЖНОСТЕЙ: "
-        f"{diagnostics['final_opportunities']}"
+        f"🎯 ВОЗМОЖНОСТЕЙ: "
+        f"{diagnostics.get('final_opportunities', 0)}"
+    )
+
+    print(
+        f"🌐 Время сети: "
+        f"{diagnostics.get('network_time', 0):.2f} сек."
+    )
+
+    print(
+        f"🧠 Время расчётов: "
+        f"{diagnostics.get('calculation_time', 0):.2f} сек."
+    )
+
+    print(
+        f"⏱ Полное время: "
+        f"{diagnostics.get('total_time', 0):.2f} сек."
     )
 
     print("-" * 55)
 
-    for symbol, symbol_data in diagnostics.get(
-        "symbols",
-        {},
-    ).items():
-
-        print(
-            f"🪙 {symbol}: "
-            f"стаканов="
-            f"{symbol_data['order_books_received']}, "
-            f"пар="
-            f"{symbol_data['exchange_pairs_total']}, "
-            f"положительный_спред="
-            f"{symbol_data['exchange_pairs_price_possible']}, "
-            f"полных_расчётов="
-            f"{symbol_data['full_calculations']}, "
-            f"итог="
-            f"{symbol_data['final_opportunities']}"
-        )
-
-    print("-" * 55)
-    print("")
-
 
 # ============================================================
-# АВТОМАТИЧЕСКАЯ ОЧИСТКА
+# ОЧИСТКА
 # ============================================================
 
 def cleanup_old_data():
@@ -2265,12 +2812,17 @@ def cleanup_old_data():
 
             for (
                 key,
-                last_sent,
+                data,
             ) in last_sent_notifications.items()
 
             if (
                 current_time
-                - last_sent
+                - safe_float(
+                    data.get(
+                        "time",
+                        0,
+                    )
+                )
                 > NOTIFICATION_COOLDOWN * 2
             )
         ]
@@ -2282,12 +2834,42 @@ def cleanup_old_data():
                 None,
             )
 
+    with cache_lock:
+
+        old_cache_keys = [
+
+            key
+
+            for (
+                key,
+                order_book,
+            ) in order_book_cache.items()
+
+            if (
+                current_time
+                - safe_float(
+                    order_book.get(
+                        "cached_at",
+                        0.0,
+                    )
+                )
+                > ORDER_BOOK_CACHE_MAX_AGE
+            )
+        ]
+
+        for key in old_cache_keys:
+
+            order_book_cache.pop(
+                key,
+                None,
+            )
+
 
 # ============================================================
-# ОТПРАВКА ВОЗМОЖНОСТИ
+# АНТИСПАМ УВЕДОМЛЕНИЙ
 # ============================================================
 
-def send_opportunity_to_telegram(
+def should_send_notification(
     opportunity
 ):
 
@@ -2301,24 +2883,110 @@ def send_opportunity_to_telegram(
 
     with notification_lock:
 
-        last_sent = (
+        previous = (
             last_sent_notifications.get(
+                notification_key
+            )
+        )
+
+        if not previous:
+
+            return (
+                True,
                 notification_key,
+            )
+
+        last_time = safe_float(
+            previous.get(
+                "time",
+                0,
+            )
+        )
+
+        last_profit = safe_float(
+            previous.get(
+                "profit",
+                0,
+            )
+        )
+
+        last_score = safe_float(
+            previous.get(
+                "score",
                 0,
             )
         )
 
         if (
             current_time
-            - last_sent
-            < NOTIFICATION_COOLDOWN
+            - last_time
+            >= NOTIFICATION_COOLDOWN
         ):
 
-            return False
+            return (
+                True,
+                notification_key,
+            )
+
+        profit_improved = (
+            opportunity[
+                "net_profit_percent"
+            ]
+            >= (
+                last_profit
+                + NOTIFICATION_PROFIT_IMPROVEMENT_PERCENT
+            )
+        )
+
+        score_improved = (
+            opportunity[
+                "quality_score"
+            ]
+            >= (
+                last_score
+                + NOTIFICATION_SCORE_IMPROVEMENT
+            )
+        )
+
+        if (
+            profit_improved
+            or score_improved
+        ):
+
+            return (
+                True,
+                notification_key,
+            )
+
+        return (
+            False,
+            notification_key,
+        )
+
+
+# ============================================================
+# ОТПРАВКА В TELEGRAM
+# ============================================================
+
+def send_opportunity_to_telegram(
+    opportunity
+):
+
+    should_send, notification_key = (
+        should_send_notification(
+            opportunity
+        )
+    )
+
+    if not should_send:
+
+        return False
 
     opportunity_id = str(
         uuid.uuid4()
     )[:8]
+
+    current_time = time.time()
 
     with pending_lock:
 
@@ -2405,8 +3073,8 @@ def send_opportunity_to_telegram(
 ━━━━━━━━━━━━━━━━━━
 
 🔄 После нажатия «ДА» бот
-получит новые стаканы только
-с этих двух бирж и пересчитает
+получит новые стаканы с этих двух бирж
+без использования кэша и пересчитает
 всю сделку заново.
 
 🧪 <b>ТЕСТОВЫЙ РЕЖИМ</b>
@@ -2417,7 +3085,6 @@ def send_opportunity_to_telegram(
 
         "inline_keyboard": [
             [
-
                 {
                     "text":
                         "🔄 ДА — ПРОВЕРИТЬ",
@@ -2448,7 +3115,21 @@ def send_opportunity_to_telegram(
 
             last_sent_notifications[
                 notification_key
-            ] = current_time
+            ] = {
+
+                "time":
+                    current_time,
+
+                "profit":
+                    opportunity[
+                        "net_profit_percent"
+                    ],
+
+                "score":
+                    opportunity[
+                        "quality_score"
+                    ],
+            }
 
         print(
             f"📨 Telegram: "
@@ -2495,7 +3176,9 @@ def recheck_opportunity(
 
         if (
             time.time()
-            - opportunity["created_at"]
+            - opportunity[
+                "created_at"
+            ]
             > OPPORTUNITY_TTL
         ):
 
@@ -2509,20 +3192,39 @@ def recheck_opportunity(
                 "Возможность устарела.",
             )
 
-        symbol = opportunity["symbol"]
-        buy_exchange = opportunity["buy_exchange"]
-        sell_exchange = opportunity["sell_exchange"]
+        symbol = (
+            opportunity["symbol"]
+        )
+
+        buy_exchange = (
+            opportunity[
+                "buy_exchange"
+            ]
+        )
+
+        sell_exchange = (
+            opportunity[
+                "sell_exchange"
+            ]
+        )
+
+    # --------------------------------------------------------
+    # Повторная проверка всегда идёт напрямую.
+    # Кэш здесь намеренно не используется.
+    # --------------------------------------------------------
 
     buy_future = NETWORK_EXECUTOR.submit(
         get_order_book,
         buy_exchange,
         symbol,
+        False,
     )
 
     sell_future = NETWORK_EXECUTOR.submit(
         get_order_book,
         sell_exchange,
         symbol,
+        False,
     )
 
     try:
@@ -2566,14 +3268,31 @@ def recheck_opportunity(
         symbol
     )
 
+    passes, reason = (
+        passes_fast_precheck(
+            buy_exchange,
+            buy_order_book,
+            sell_exchange,
+            sell_order_book,
+        )
+    )
+
+    if not passes:
+
+        return (
+            None,
+            "После повторной проверки "
+            "быстрый фильтр больше не проходит.",
+        )
+
     current_opportunity = (
         calculate_order_book_opportunity(
-            symbol=symbol,
-            buy_exchange=buy_exchange,
-            buy_order_book=buy_order_book,
-            sell_exchange=sell_exchange,
-            sell_order_book=sell_order_book,
-            diagnostics=diagnostics,
+            symbol,
+            buy_exchange,
+            buy_order_book,
+            sell_exchange,
+            sell_order_book,
+            diagnostics,
         )
     )
 
@@ -2595,7 +3314,7 @@ def recheck_opportunity(
 
 
 # ============================================================
-# ОБРАБОТКА TELEGRAM КНОПОК
+# TELEGRAM CALLBACK
 # ============================================================
 
 def handle_callback(
@@ -2671,7 +3390,7 @@ def handle_callback(
 
         answer_callback_query(
             callback_id,
-            "Повторно проверяю...",
+            "Получаю новые стаканы...",
         )
 
         current, error = (
@@ -2746,7 +3465,7 @@ def handle_callback(
 
 
 # ============================================================
-# TELEGRAM LONG POLLING
+# TELEGRAM POLLING
 # ============================================================
 
 def telegram_polling():
@@ -2762,6 +3481,7 @@ def telegram_polling():
         try:
 
             request_data = {
+
                 "timeout":
                     TELEGRAM_LONG_POLL_TIMEOUT,
             }
@@ -2798,7 +3518,9 @@ def telegram_polling():
             ):
 
                 offset = (
-                    update["update_id"]
+                    update[
+                        "update_id"
+                    ]
                     + 1
                 )
 
@@ -2857,41 +3579,44 @@ def send_scan_diagnostics_to_telegram(
     text = f"""
 📊 <b>ДИАГНОСТИКА СКАНА</b>
 
-📚 Запросов стаканов:
-<b>{diagnostics['order_book_requests']}</b>
+📚 Запросов:
+<b>{diagnostics.get('order_book_requests', 0)}</b>
 
-✅ Получено стаканов:
-<b>{diagnostics['order_books_received']}</b>
+💾 Из кэша:
+<b>{diagnostics.get('order_books_from_cache', 0)}</b>
 
-🔗 Проверено направлений:
-<b>{diagnostics['exchange_pairs_total']}</b>
+✅ Получено:
+<b>{diagnostics.get('order_books_received', 0)}</b>
 
-🔎 Направлений с положительным спредом:
-<b>{diagnostics['exchange_pairs_price_possible']}</b>
+❌ Ошибок:
+<b>{diagnostics.get('order_books_failed', 0)}</b>
 
-🚫 Без положительного ценового направления:
-<b>{diagnostics['rejected_fast_precheck']}</b>
+⏸ Бирж в cooldown:
+<b>{diagnostics.get('exchanges_skipped_cooldown', 0)}</b>
+
+🔗 Направлений:
+<b>{diagnostics.get('exchange_pairs_total', 0)}</b>
+
+💸 Отсеяно комиссиями заранее:
+<b>{diagnostics.get('rejected_fast_fee_precheck', 0)}</b>
 
 🧮 Полных расчётов:
-<b>{diagnostics['full_calculations']}</b>
-
-💧 Ликвидность покупки:
-<b>{diagnostics['rejected_buy_liquidity']}</b>
-
-💧 Ликвидность продажи:
-<b>{diagnostics['rejected_sell_liquidity']}</b>
-
-📉 Проскальзывание:
-<b>
-{diagnostics['rejected_buy_slippage']
-+ diagnostics['rejected_sell_slippage']}
-</b>
+<b>{diagnostics.get('full_calculations', 0)}</b>
 
 📈 Недостаточная прибыль:
-<b>{diagnostics['rejected_profit']}</b>
+<b>{diagnostics.get('rejected_profit', 0)}</b>
 
-🎯 Итоговых возможностей:
-<b>{diagnostics['final_opportunities']}</b>
+🎯 Возможностей:
+<b>{diagnostics.get('final_opportunities', 0)}</b>
+
+🌐 Сеть:
+<b>{diagnostics.get('network_time', 0):.2f} сек.</b>
+
+🧠 Расчёты:
+<b>{diagnostics.get('calculation_time', 0):.2f} сек.</b>
+
+⏱ Полный скан:
+<b>{diagnostics.get('total_time', 0):.2f} сек.</b>
 """
 
     send_telegram_message(
@@ -2900,7 +3625,7 @@ def send_scan_diagnostics_to_telegram(
 
 
 # ============================================================
-# ГЛАВНЫЙ ЦИКЛ СКАНЕРА
+# ГЛАВНЫЙ ЦИКЛ
 # ============================================================
 
 def scanner_loop():
@@ -2930,16 +3655,13 @@ def scanner_loop():
             )
 
             print(
-                f"🪙 Монет: {len(SYMBOLS)}"
+                f"🪙 Монет: "
+                f"{len(SYMBOLS)}"
             )
 
             print(
-                f"🏦 Бирж: {len(exchanges)}"
-            )
-
-            print(
-                "⚡ Используются два независимых "
-                "пула потоков"
+                f"🏦 Бирж: "
+                f"{len(exchanges)}"
             )
 
             (
@@ -2949,7 +3671,9 @@ def scanner_loop():
 
             with lock:
 
-                last_opportunities = opportunities
+                last_opportunities = (
+                    opportunities
+                )
 
                 last_scan_time = (
                     datetime.now()
@@ -3066,7 +3790,7 @@ def start_background_services():
 
         print("")
         print("=" * 55)
-        print("🚀 ЗАПУСК АРБИТРАЖНОЙ СИСТЕМЫ")
+        print("🚀 ЗАПУСК ОПТИМИЗИРОВАННОЙ СИСТЕМЫ")
         print("=" * 55)
 
         print(
@@ -3099,6 +3823,16 @@ def start_background_services():
             f"{NETWORK_WORKERS}"
         )
 
+        print(
+            f"💾 Cache TTL: "
+            f"{ORDER_BOOK_CACHE_TTL} сек."
+        )
+
+        print(
+            f"⏱ Scan timeout: "
+            f"{TOTAL_SCAN_TIMEOUT} сек."
+        )
+
         load_all_markets()
 
         telegram_ok = (
@@ -3118,13 +3852,6 @@ def start_background_services():
             telegram_thread.start()
 
             telegram_started = True
-
-        else:
-
-            print(
-                "⚠️ Telegram polling "
-                "не запущен."
-            )
 
         cleanup_thread = (
             threading.Thread(
@@ -3296,7 +4023,6 @@ th {
 🟢 Арбитражный сканер активен
 </div>
 
-
 <div class="stats-grid">
 
 <div class="stat-box">
@@ -3337,7 +4063,6 @@ th {
 
 </div>
 
-
 <div class="card">
 
 💰 Максимальный бюджет:
@@ -3350,21 +4075,20 @@ th {
 
 <br><br>
 
-⚡ Отдельный пул сканирования:
+💾 Кэш стаканов:
 <b>ВКЛЮЧЕН</b>
 
 <br><br>
 
-🌐 Отдельный сетевой пул:
-<b>ВКЛЮЧЕН</b>
+⚡ Оптимизированные расчёты:
+<b>ВКЛЮЧЕНЫ</b>
 
 <br><br>
 
-📊 Диагностика отбрасывания:
+🛡️ Защита проблемных бирж:
 <b>ВКЛЮЧЕНА</b>
 
 </div>
-
 
 {% if diagnostics %}
 
@@ -3380,43 +4104,58 @@ th {
 </tr>
 
 <tr>
+<td>Запросов стаканов</td>
+<td>{{ diagnostics.order_book_requests }}</td>
+</tr>
+
+<tr>
+<td>Стаканов из кэша</td>
+<td>{{ diagnostics.order_books_from_cache }}</td>
+</tr>
+
+<tr>
 <td>Получено стаканов</td>
 <td>{{ diagnostics.order_books_received }}</td>
 </tr>
 
 <tr>
-<td>Всего направлений</td>
+<td>Ошибок стаканов</td>
+<td>{{ diagnostics.order_books_failed }}</td>
+</tr>
+
+<tr>
+<td>Направлений проверено</td>
 <td>{{ diagnostics.exchange_pairs_total }}</td>
 </tr>
 
 <tr>
-<td>Направлений с положительным спредом</td>
-<td>{{ diagnostics.exchange_pairs_price_possible }}</td>
+<td>Отсеяно комиссиями заранее</td>
+<td>{{ diagnostics.rejected_fast_fee_precheck }}</td>
 </tr>
 
 <tr>
-<td>Нет положительного ценового направления</td>
-<td>{{ diagnostics.rejected_fast_precheck }}</td>
-</tr>
-
-<tr>
-<td>Полных расчётов выполнено</td>
+<td>Полных расчётов</td>
 <td>{{ diagnostics.full_calculations }}</td>
-</tr>
-
-<tr>
-<td>Недостаточная ликвидность покупки</td>
-<td>{{ diagnostics.rejected_buy_liquidity }}</td>
-</tr>
-
-<tr>
-<td>Недостаточная ликвидность продажи</td>
-<td>{{ diagnostics.rejected_sell_liquidity }}</td>
 </tr>
 
 <tr>
 <td>Недостаточная прибыль</td>
 <td>{{ diagnostics.rejected_profit }}</td>
+</tr>
+
+<tr>
+<td>Время сети</td>
+<td>{{ "%.2f"|format(diagnostics.network_time) }} сек.</td>
+</tr>
+
+<tr>
+<td>Время расчётов</td>
+<td>{{ "%.2f"|format(diagnostics.calculation_time) }} сек.</td>
+</tr>
+
+<tr>
+<td>Полное время</td>
+<td>{{ "%.2f"|format(diagnostics.total_time) }} сек.</td>
 </tr>
 
 <tr>
@@ -3429,7 +4168,6 @@ th {
 </div>
 
 {% endif %}
-
 
 {% if current_symbols %}
 
@@ -3446,7 +4184,6 @@ th {
 </div>
 
 {% endif %}
-
 
 {% if opportunities %}
 
@@ -3479,7 +4216,6 @@ th {
 
 </div>
 
-
 <div class="buy">
 
 🟢 КУПИТЬ
@@ -3502,7 +4238,6 @@ ${{ op.buy_exchange_liquidity }}
 </div>
 
 </div>
-
 
 <div class="sell">
 
@@ -3539,16 +4274,15 @@ ${{ op.sell_exchange_liquidity }}
 
 <br><br>
 
-Смотри блок «Последняя диагностика» —
-теперь там видно, на каком именно этапе
-отбрасываются направления.
+Смотри блок диагностики —
+теперь видно скорость скана,
+кэш и количество отсеянных направлений.
 
 </div>
 
 {% endif %}
 
 </div>
-
 
 <script>
 
@@ -3665,6 +4399,18 @@ def scan_api():
             total_failed_order_books
         )
 
+    with exchange_stats_lock:
+
+        exchange_statistics = {
+
+            exchange_id: dict(stats)
+
+            for (
+                exchange_id,
+                stats,
+            ) in exchange_stats.items()
+        }
+
     return jsonify({
 
         "status": "success",
@@ -3722,6 +4468,9 @@ def scan_api():
         "diagnostics":
             diagnostics,
 
+        "exchange_statistics":
+            exchange_statistics,
+
         "opportunities":
             opportunities,
     })
@@ -3765,6 +4514,12 @@ def health():
 
         "network_workers":
             NETWORK_WORKERS,
+
+        "order_book_cache_ttl":
+            ORDER_BOOK_CACHE_TTL,
+
+        "total_scan_timeout":
+            TOTAL_SCAN_TIMEOUT,
 
         "separate_thread_pools":
             True,
