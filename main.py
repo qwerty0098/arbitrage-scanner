@@ -6,7 +6,6 @@ from datetime import datetime
 from concurrent.futures import (
     ThreadPoolExecutor,
     as_completed,
-    wait,
 )
 
 import ccxt
@@ -47,11 +46,7 @@ TRADE_AMOUNT_USD = 1000.0
 # ПРИБЫЛЬ И КОМИССИИ
 # ============================================================
 
-# Для тестирования снижаем порог.
-# Это позволит убедиться, что сканер действительно находит
-# реальные возможности и Telegram работает.
-#
-# После диагностики можно увеличить до 0.30-0.50.
+# Минимальная чистая прибыль после полного расчёта.
 MIN_NET_PROFIT_PERCENT = 0.20
 
 # Дополнительный резерв на небольшое ухудшение исполнения.
@@ -93,11 +88,10 @@ CLEANUP_INTERVAL = 60
 # ДИАГНОСТИКА
 # ============================================================
 
-# Включить подробную статистику в Railway logs
+# Включить подробную статистику в Railway logs.
 DEBUG_DIAGNOSTICS = True
 
 # Отправлять краткую диагностику в Telegram после каждого скана.
-# Рекомендуется сначала оставить False, чтобы не засорять чат.
 TELEGRAM_DIAGNOSTICS = False
 
 # Если True — отправляем сообщение в Telegram даже если
@@ -282,7 +276,6 @@ notification_lock = threading.RLock()
 pending_lock = threading.RLock()
 startup_lock = threading.Lock()
 stats_lock = threading.RLock()
-diagnostics_lock = threading.RLock()
 
 
 # ============================================================
@@ -318,9 +311,14 @@ def create_diagnostics(
         "order_books_failed": 0,
 
         "exchange_pairs_total": 0,
+
+        # Направления, где Sell Bid > Buy Ask.
+        # Это ещё НЕ означает наличие прибыли.
         "exchange_pairs_price_possible": 0,
 
+        # Направления, где Sell Bid <= Buy Ask.
         "rejected_fast_precheck": 0,
+
         "rejected_buy_liquidity": 0,
         "rejected_sell_liquidity": 0,
         "rejected_buy_execution": 0,
@@ -1233,51 +1231,57 @@ def passes_fast_precheck(
     sell_order_book
 ):
 
-    buy_ask = (
-        buy_order_book[
-            "best_ask"
-        ]
+    # Получаем лучшие цены безопасно.
+    buy_ask = safe_float(
+        buy_order_book.get(
+            "best_ask",
+            0.0,
+        )
     )
 
-    sell_bid = (
-        sell_order_book[
-            "best_bid"
-        ]
+    sell_bid = safe_float(
+        sell_order_book.get(
+            "best_bid",
+            0.0,
+        )
     )
+
+    # --------------------------------------------------------
+    # ЗАЩИТА ОТ НЕКОРРЕКТНЫХ ЦЕН
+    # --------------------------------------------------------
+
+    if buy_ask <= 0:
+
+        return False
+
+    if sell_bid <= 0:
+
+        return False
+
+
+    # --------------------------------------------------------
+    # ВАЖНО
+    #
+    # Быстрый фильтр НЕ учитывает заранее:
+    #
+    # - комиссию покупки
+    # - комиссию продажи
+    # - защитный буфер
+    # - минимальную чистую прибыль
+    #
+    # Эти параметры проверяются только после реальной
+    # симуляции покупки и продажи по уровням стакана.
+    #
+    # Здесь проверяется только наличие потенциального
+    # положительного ценового направления.
+    # --------------------------------------------------------
 
     if sell_bid <= buy_ask:
 
         return False
 
-    buy_fee = EXCHANGE_FEES.get(
-        buy_exchange,
-        0.20,
-    )
 
-    sell_fee = EXCHANGE_FEES.get(
-        sell_exchange,
-        0.20,
-    )
-
-    minimum_required_spread = (
-        buy_fee
-        + sell_fee
-        + EXTRA_COST_BUFFER_PERCENT
-        + MIN_NET_PROFIT_PERCENT
-    )
-
-    gross_spread = (
-        (
-            sell_bid
-            - buy_ask
-        )
-        / buy_ask
-    ) * 100
-
-    return (
-        gross_spread
-        >= minimum_required_spread
-    )
+    return True
 
 
 # ============================================================
@@ -1530,9 +1534,6 @@ def calculate_order_book_opportunity(
         )
     )
 
-    # Проверяем, что на стороне продажи ликвидности
-    # достаточно хотя бы для стоимости фактически
-    # купленного количества.
     required_sell_liquidity = (
         buy_result["quantity"]
         * sell_order_book["best_bid"]
@@ -1927,6 +1928,16 @@ def scan_symbol(
                 sell_exchange
             ]
 
+            # ------------------------------------------------
+            # ПРЕДВАРИТЕЛЬНАЯ ПРОВЕРКА
+            #
+            # Здесь отбрасываются только направления, где
+            # цена продажи не выше цены покупки.
+            #
+            # Комиссии и минимальная прибыль проверяются
+            # только в полном расчёте.
+            # ------------------------------------------------
+
             if not passes_fast_precheck(
                 buy_exchange,
                 buy_book,
@@ -2127,13 +2138,18 @@ def print_diagnostics(
     )
 
     print(
-        f"💰 Прошли быстрый фильтр: "
+        f"🔎 Направлений с положительным спредом: "
         f"{diagnostics['exchange_pairs_price_possible']}"
     )
 
     print(
-        f"🚫 Быстрый фильтр: "
+        f"🚫 Нет положительного ценового направления: "
         f"{diagnostics['rejected_fast_precheck']}"
+    )
+
+    print(
+        f"🧮 Полных расчётов выполнено: "
+        f"{diagnostics['full_calculations']}"
     )
 
     print(
@@ -2194,8 +2210,10 @@ def print_diagnostics(
             f"{symbol_data['order_books_received']}, "
             f"пар="
             f"{symbol_data['exchange_pairs_total']}, "
-            f"кандидатов="
+            f"положительный_спред="
             f"{symbol_data['exchange_pairs_price_possible']}, "
+            f"полных_расчётов="
+            f"{symbol_data['full_calculations']}, "
             f"итог="
             f"{symbol_data['final_opportunities']}"
         )
@@ -2848,11 +2866,14 @@ def send_scan_diagnostics_to_telegram(
 🔗 Проверено направлений:
 <b>{diagnostics['exchange_pairs_total']}</b>
 
-💰 Прошли первичный фильтр:
+🔎 Направлений с положительным спредом:
 <b>{diagnostics['exchange_pairs_price_possible']}</b>
 
-🚫 Отброшено первичным фильтром:
+🚫 Без положительного ценового направления:
 <b>{diagnostics['rejected_fast_precheck']}</b>
+
+🧮 Полных расчётов:
+<b>{diagnostics['full_calculations']}</b>
 
 💧 Ликвидность покупки:
 <b>{diagnostics['rejected_buy_liquidity']}</b>
@@ -3369,13 +3390,18 @@ th {
 </tr>
 
 <tr>
-<td>Прошли быстрый фильтр</td>
+<td>Направлений с положительным спредом</td>
 <td>{{ diagnostics.exchange_pairs_price_possible }}</td>
 </tr>
 
 <tr>
-<td>Отброшено быстрым фильтром</td>
+<td>Нет положительного ценового направления</td>
 <td>{{ diagnostics.rejected_fast_precheck }}</td>
+</tr>
+
+<tr>
+<td>Полных расчётов выполнено</td>
+<td>{{ diagnostics.full_calculations }}</td>
 </tr>
 
 <tr>
@@ -3514,8 +3540,8 @@ ${{ op.sell_exchange_liquidity }}
 <br><br>
 
 Смотри блок «Последняя диагностика» —
-теперь там видно, почему сделки
-отбрасываются.
+теперь там видно, на каком именно этапе
+отбрасываются направления.
 
 </div>
 
